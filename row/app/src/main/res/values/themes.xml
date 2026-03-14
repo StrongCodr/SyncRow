@@ -1,0 +1,10 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Base.Theme.Row" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Toolbar / primary color -->
+        <item name="colorPrimary">#008080</item>      <!-- background -->
+        <item name="colorOnPrimary">#FFFFFFFF</item> <!-- text & icons -->
+    </style>
+
+    <style name="Theme.Row" parent="Base.Theme.Row" />
+</resources>
