@@ -95,6 +95,7 @@ class IntervalRecordingService : Service() {
         private fun strokesKey(mac: String) = "live_strokes_$mac"
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
+        private fun latenessKey(mac: String) = "live_lateness_$mac"
 
         private val nextIntervalId = AtomicLong(System.currentTimeMillis())
 
@@ -267,6 +268,7 @@ class IntervalRecordingService : Service() {
     private var serviceInForeground = false
 
     private val activeSensors = mutableMapOf<String, ActiveSensor>() // key: mac
+    private val strokeAnalyzer = StrokeAnalyzer()
     private var sessionIntervalId: Long = -1L
     private var healthMonitorActive = false
     private val pendingUploadActive = AtomicBoolean(false)
@@ -442,6 +444,7 @@ class IntervalRecordingService : Service() {
         intervalStartElapsedMs = SystemClock.elapsedRealtime()
         locationSamples.clear()
         latestLocation = null
+        strokeAnalyzer.reset()
 
         prefs.edit()
             .putBoolean(KEY_INTERVAL_RUNNING, true)
@@ -492,11 +495,14 @@ class IntervalRecordingService : Service() {
                 connectSensor(existing)
             }
 
+            strokeAnalyzer.addSensor(s.mac, s.seatIndex)
+
             prefs.edit()
                 .putString(statusKey(s.mac), "RECORDING")
                 .putBoolean(connectedKey(s.mac), false)
                 .putInt(strokesKey(s.mac), 0)
                 .putInt(spmKey(s.mac), 0)
+                .putLong(latenessKey(s.mac), Long.MIN_VALUE)
                 .apply()
         }
 
@@ -1020,12 +1026,22 @@ class IntervalRecordingService : Service() {
                     sensor.lastStoredSampleMs = nowWall
                     updateStrokeDetector(sensor, nowWall, latest.ax, latest.ay, latest.az)
 
-                    prefs.edit()
+                    // Feed to stroke analyzer for catch detection & lateness
+                    val lateness = strokeAnalyzer.onSample(
+                        sensor.mac, nowWall,
+                        latest.pitch, latest.roll, latest.yaw,
+                        latest.wx, latest.wy, latest.wz
+                    )
+
+                    val prefsEdit = prefs.edit()
                         .putString(statusKey(sensor.mac), "RECORDING")
                         .putInt(strokesKey(sensor.mac), sensor.strokeCount)
                         .putInt(spmKey(sensor.mac), sensor.currentSpm)
                         .putBoolean(connectedKey(sensor.mac), true)
-                        .apply()
+                    if (lateness != null) {
+                        prefsEdit.putLong(latenessKey(sensor.mac), lateness)
+                    }
+                    prefsEdit.apply()
                 }
 
                 nextTickMs += targetSamplePeriodMs

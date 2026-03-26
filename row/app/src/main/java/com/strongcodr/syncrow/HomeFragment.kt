@@ -37,7 +37,8 @@ class HomeFragment : Fragment() {
     private var lastRenderedMode: RowingMode? = null
 
     private data class SweepRowRef(
-        val status: TextView
+        val status: TextView,
+        val lateness: TextView? = null
     )
 
     private data class ScullingSideRef(
@@ -362,7 +363,16 @@ class HomeFragment : Fragment() {
             sensors.forEach { sensor ->
                 val connected = prefs.getBoolean(connectedKey(sensor.mac), false)
                 if (connected) connectedSeats += 1
-                sweepRows[sensor.id]?.status?.text = "Status: ${if (connected) "Connected" else "Disconnected"}"
+                val ref = sweepRows[sensor.id]
+                ref?.status?.text = "Status: ${if (connected) "Connected" else "Disconnected"}"
+
+                val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
+                ref?.lateness?.text = if (latenessMs == Long.MIN_VALUE) {
+                    "Lateness vs Stroke: -- ms"
+                } else {
+                    val sign = if (latenessMs > 0) "+" else ""
+                    "Lateness vs Stroke: $sign${latenessMs} ms"
+                }
             }
             binding.textCrewSummary.text = "$connectedSeats/$total seats connected"
             return
@@ -453,7 +463,8 @@ class HomeFragment : Fragment() {
         })
 
         return bubble to SweepRowRef(
-            status = statusView
+            status = statusView,
+            lateness = latenessView
         )
     }
 
@@ -592,5 +603,6 @@ class HomeFragment : Fragment() {
         private fun strokesKey(mac: String) = "live_strokes_$mac"
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
+        private fun latenessKey(mac: String) = "live_lateness_$mac"
     }
 }

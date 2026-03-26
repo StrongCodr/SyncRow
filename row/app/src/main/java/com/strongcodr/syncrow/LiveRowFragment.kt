@@ -61,6 +61,15 @@ class LiveRowFragment : Fragment() {
                 views.status.text = displayStatus
                 views.spm.text = "SPM: $spm"
                 views.strokes.text = "Strokes: $strokes"
+
+                val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
+                views.lateness?.text = if (latenessMs == Long.MIN_VALUE) {
+                    "Lateness vs Stroke: -- ms"
+                } else {
+                    val sign = if (latenessMs > 0) "+" else ""
+                    "Lateness vs Stroke: $sign${latenessMs} ms"
+                }
+
                 spmSum += spm
                 spmCount += 1
             }
@@ -84,7 +93,8 @@ class LiveRowFragment : Fragment() {
     private data class RowViews(
         val status: android.widget.TextView,
         val spm: android.widget.TextView,
-        val strokes: android.widget.TextView
+        val strokes: android.widget.TextView,
+        val lateness: android.widget.TextView? = null
     )
 
     private val rowViews = ConcurrentHashMap<Long, RowViews>()
@@ -319,7 +329,7 @@ class LiveRowFragment : Fragment() {
             }
             card.addView(inner)
             b.containerSensors.addView(card)
-            rowViews[sensor.id] = RowViews(status, spm, strokes)
+            rowViews[sensor.id] = RowViews(status, spm, strokes, lateness)
         }
     }
 
@@ -492,5 +502,6 @@ class LiveRowFragment : Fragment() {
         private fun strokesKey(mac: String) = "live_strokes_$mac"
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
+        private fun latenessKey(mac: String) = "live_lateness_$mac"
     }
 }
