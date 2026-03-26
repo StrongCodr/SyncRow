@@ -11,13 +11,13 @@ val localProps = Properties().apply {
 }
 
 android {
-    namespace = "com.example.row"
+    namespace = "com.strongcodr.syncrow"
     compileSdk {
         version = release(36)
     }
 
     defaultConfig {
-        applicationId = "com.example.row"
+        applicationId = "com.strongcodr.syncrow"
         minSdk = 24
         targetSdk = 36
         versionCode = 1

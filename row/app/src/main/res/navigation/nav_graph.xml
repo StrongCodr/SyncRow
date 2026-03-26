@@ -7,31 +7,31 @@
 
     <fragment
         android:id="@+id/homeFragment"
-        android:name="com.example.row.HomeFragment"
+        android:name="com.strongcodr.syncrow.HomeFragment"
         android:label="SyncRow"
         tools:layout="@layout/fragment_home" />
 
     <fragment
         android:id="@+id/manageSensorsFragment"
-        android:name="com.example.row.ManageSensorsFragment"
+        android:name="com.strongcodr.syncrow.ManageSensorsFragment"
         android:label="Manage Sensors"
         tools:layout="@layout/fragment_manage_sensors" />
 
     <fragment
         android:id="@+id/addSensorFragment"
-        android:name="com.example.row.FirstFragment"
+        android:name="com.strongcodr.syncrow.FirstFragment"
         android:label="Add Sensor"
         tools:layout="@layout/fragment_first" />
 
     <fragment
         android:id="@+id/liveRowFragment"
-        android:name="com.example.row.LiveRowFragment"
+        android:name="com.strongcodr.syncrow.LiveRowFragment"
         android:label="Live Row"
         tools:layout="@layout/fragment_live_row" />
 
     <fragment
         android:id="@+id/intervalsFragment"
-        android:name="com.example.row.IntervalsFragment"
+        android:name="com.strongcodr.syncrow.IntervalsFragment"
         android:label="Previous Intervals"
         tools:layout="@layout/fragment_intervals" />
 </navigation>
