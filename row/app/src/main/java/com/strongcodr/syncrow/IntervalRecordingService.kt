@@ -56,7 +56,6 @@ import java.io.File
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class IntervalRecordingService : Service() {
@@ -119,38 +118,48 @@ class IntervalRecordingService : Service() {
             val displayNames: List<String>
         )
 
+        const val COX_LABEL = "Cox"
+
         private fun buildSensorLabels(context: Context, sensors: List<Sensor>): SensorLabels {
             if (sensors.isEmpty()) return SensorLabels(emptyList(), emptyList(), emptyList())
 
             val mode = RowingModeStore.getRecordingMode(context)
-            return if (mode == RowingMode.SWEEP) {
-                val total = sensors.size
-                SensorLabels(
-                    ids = sensors.mapIndexed { idx, _ -> "Seat ${total - idx}" },
-                    seats = sensors.mapIndexed { idx, _ -> "Seat ${total - idx}" },
-                    displayNames = sensors.mapIndexed { idx, sensor ->
-                        sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Seat ${total - idx}"
+            val rowerCount = sensors.count { it.role == SensorRole.SEAT }
+            val scullingSeatCount = (rowerCount + 1) / 2
+
+            val ids = ArrayList<String>(sensors.size)
+            val seats = ArrayList<String>(sensors.size)
+            val displayNames = ArrayList<String>(sensors.size)
+
+            var rowerIdx = 0
+            sensors.forEach { sensor ->
+                if (sensor.role == SensorRole.COX) {
+                    val custom = sensor.name?.trim()?.takeIf { it.isNotEmpty() }
+                    ids.add(COX_LABEL)
+                    seats.add(COX_LABEL)
+                    displayNames.add(custom ?: COX_LABEL)
+                } else {
+                    if (mode == RowingMode.SWEEP) {
+                        val seatNumber = rowerCount - rowerIdx
+                        ids.add("Seat $seatNumber")
+                        seats.add("Seat $seatNumber")
+                        displayNames.add(
+                            sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Seat $seatNumber"
+                        )
+                    } else {
+                        val seatNumber = scullingSeatCount - (rowerIdx / 2)
+                        val side = if (rowerIdx % 2 == 0) "Port" else "Starboard"
+                        ids.add("Seat $seatNumber $side")
+                        seats.add("Seat $seatNumber")
+                        displayNames.add(
+                            sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Seat $seatNumber $side"
+                        )
                     }
-                )
-            } else {
-                val seatCount = (sensors.size + 1) / 2
-                SensorLabels(
-                    ids = sensors.mapIndexed { idx, _ ->
-                        val seatNumber = seatCount - (idx / 2)
-                        val side = if (idx % 2 == 0) "Port" else "Starboard"
-                        "Seat $seatNumber $side"
-                    },
-                    seats = sensors.mapIndexed { idx, _ ->
-                        val seatNumber = seatCount - (idx / 2)
-                        "Seat $seatNumber"
-                    },
-                    displayNames = sensors.mapIndexed { idx, sensor ->
-                        val seatNumber = seatCount - (idx / 2)
-                        val side = if (idx % 2 == 0) "Port" else "Starboard"
-                        sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Seat $seatNumber $side"
-                    }
-                )
+                    rowerIdx++
+                }
             }
+
+            return SensorLabels(ids, seats, displayNames)
         }
 
         fun start(context: Context, sensors: List<Sensor>) {
@@ -329,6 +338,20 @@ class IntervalRecordingService : Service() {
                 }
                 val sensors = readSensorsFromIntent(intent)
                 if (sensors.isEmpty()) return START_NOT_STICKY
+                // Reject cox-only recordings before we commit to foreground promotion.
+                // On Android 8+, startForegroundService must be paired with startForeground
+                // within ~5s or the app crashes with ForegroundServiceDidNotStartInTime.
+                // startInterval promotes via ensureForeground; bailing out there would miss
+                // the deadline. Stop the service cleanly here instead.
+                if (sensors.none { it.seat != COX_LABEL }) {
+                    postEventNotification(
+                        "Cannot start interval",
+                        "Add at least one rower sensor to start recording."
+                    )
+                    Log.e("SYNCROW", "startInterval rejected: no rower sensors (cox-only or empty)")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 startInterval(sensors)
             }
             ACTION_STOP -> {
@@ -419,11 +442,23 @@ class IntervalRecordingService : Service() {
         val seats = intent.getStringArrayListExtra(EXTRA_SENSOR_SEATS)
         val displayNames = intent.getStringArrayListExtra(EXTRA_SENSOR_DISPLAY_NAMES)
         if (macs != null && ids != null) {
+            // Cox sensors get seatIndex = 0; rowers are numbered 1..N from the list end so
+            // the last rower in the list is "seat 1" (stroke reference for StrokeAnalyzer).
+            val rowerCount = macs.indices.count { idx ->
+                (seats?.getOrNull(idx) ?: ids.getOrNull(idx) ?: macs[idx]) != COX_LABEL
+            }
+            var rowerIdx = 0
             return macs.mapIndexedNotNull { idx, mac ->
                 val sid = ids.getOrNull(idx) ?: mac
                 val seat = seats?.getOrNull(idx) ?: sid
-                val seatIndex = macs.size - idx
                 val displayName = displayNames?.getOrNull(idx) ?: seat
+                val seatIndex = if (seat == COX_LABEL) {
+                    0
+                } else {
+                    val n = rowerCount - rowerIdx
+                    rowerIdx++
+                    n
+                }
                 IntentSensor(mac, sid, seat, seatIndex, displayName)
             }
         }
@@ -431,10 +466,14 @@ class IntervalRecordingService : Service() {
         val mac = intent.getStringExtra(EXTRA_SENSOR_MAC) ?: return emptyList()
         val sid = intent.getStringExtra(EXTRA_SENSOR_ID) ?: mac
         val st = intent.getStringExtra(EXTRA_SEAT) ?: sid
-        return listOf(IntentSensor(mac, sid, st, 1, st))
+        val seatIndex = if (st == COX_LABEL) 0 else 1
+        return listOf(IntentSensor(mac, sid, st, seatIndex, st))
     }
 
     private fun startInterval(sensors: List<IntentSensor>) {
+        // Caller (onStartCommand) guarantees at least one rower sensor — cox-only is
+        // rejected upstream so we never hit the foreground-service deadline on reject.
+
         if (!serviceActive) {
             serviceActive = true
         }
@@ -501,7 +540,11 @@ class IntervalRecordingService : Service() {
                 connectSensor(existing)
             }
 
-            strokeAnalyzer.addSensor(s.mac, s.seatIndex)
+            // Cox doesn't row — exclude from stroke detection. Its samples still flow to
+            // disk and InfluxDB as regular IMU data, just not through StrokeAnalyzer.
+            if (s.seat != COX_LABEL) {
+                strokeAnalyzer.addSensor(s.mac, s.seatIndex)
+            }
 
             prefs.edit()
                 .putString(statusKey(s.mac), "RECORDING")
@@ -1782,6 +1825,7 @@ class IntervalRecordingService : Service() {
         val file = File(dir, "summary_${sessionId}.json")
 
         val seats = activeSensors.values
+            .filter { it.seat != COX_LABEL } // Cox has no strokes; excluded from the per-seat recap.
             .sortedByDescending { it.seatIndex } // Seat 1 is bottom (smallest index)
             .map { sensor ->
                 val avgSpm = if (durationMs > 0) {

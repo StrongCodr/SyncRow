@@ -228,18 +228,10 @@ class HomeFragment : Fragment() {
             return
         }
 
-        // Start service using all sensors, then go to Live Row
-        val legacyIds = sensors.mapIndexed { idx, _ -> "Seat ${sensors.size - idx}" }
-        Log.d(
-            "SYNCROW",
-            "Pre-start proof only (not upload proof): legacy sensor_id labels=$legacyIds uiMode=${RowingModeStore.getUiMode(requireContext())}"
-        )
         IntervalRecordingService.start(
             context = requireContext(),
             sensors = sensors
         )
-        Log.d("SYNCROW", "Recorder start requested with legacy sensor_id labels=$legacyIds")
-
         findNavController().navigate(R.id.liveRowFragment)
     }
 
@@ -338,9 +330,16 @@ class HomeFragment : Fragment() {
         container.visibility = View.VISIBLE
 
         if (mode == RowingMode.SWEEP) {
-            val total = sensors.size
-            sensors.forEachIndexed { idx, sensor ->
-                val seatNumber = total - idx
+            val rowerCount = sensors.count { it.role == SensorRole.SEAT }
+            var rowerIdx = 0
+            sensors.forEach { sensor ->
+                val seatNumber = if (sensor.role == SensorRole.COX) {
+                    0
+                } else {
+                    val n = rowerCount - rowerIdx
+                    rowerIdx++
+                    n
+                }
                 val row = createSweepSensorBubble(sensor, seatNumber)
                 container.addView(row.first)
                 sweepRows[sensor.id] = row.second
@@ -358,23 +357,35 @@ class HomeFragment : Fragment() {
 
     private fun updateDynamicUi(sensors: List<Sensor>, mode: RowingMode) {
         if (mode == RowingMode.SWEEP) {
-            val total = sensors.size
+            // Cox is a sensor but not a seat — count it separately.
+            val rowers = sensors.filter { it.role == SensorRole.SEAT }
+            val totalSeats = rowers.size
             var connectedSeats = 0
             sensors.forEach { sensor ->
                 val connected = prefs.getBoolean(connectedKey(sensor.mac), false)
-                if (connected) connectedSeats += 1
+                if (connected && sensor.role == SensorRole.SEAT) connectedSeats += 1
                 val ref = sweepRows[sensor.id]
                 ref?.status?.text = "Status: ${if (connected) "Connected" else "Disconnected"}"
 
-                val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
-                ref?.lateness?.text = if (latenessMs == Long.MIN_VALUE) {
-                    "Lateness vs Stroke: -- ms"
+                // Cox has no stroke/lateness by design — suppress the line.
+                if (sensor.role == SensorRole.COX) {
+                    ref?.lateness?.text = "Hull reference (no stroke)"
                 } else {
-                    val sign = if (latenessMs > 0) "+" else ""
-                    "Lateness vs Stroke: $sign${latenessMs} ms"
+                    val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
+                    ref?.lateness?.text = if (latenessMs == Long.MIN_VALUE) {
+                        "Lateness vs Stroke: -- ms"
+                    } else {
+                        val sign = if (latenessMs > 0) "+" else ""
+                        "Lateness vs Stroke: $sign${latenessMs} ms"
+                    }
                 }
             }
-            binding.textCrewSummary.text = "$connectedSeats/$total seats connected"
+            val cox = sensors.firstOrNull { it.role == SensorRole.COX }
+            val coxSuffix = if (cox != null) {
+                val coxConnected = prefs.getBoolean(connectedKey(cox.mac), false)
+                if (coxConnected) "  •  Cox $COX_INDICATOR" else "  •  Cox offline"
+            } else ""
+            binding.textCrewSummary.text = "$connectedSeats/$totalSeats seats connected$coxSuffix"
             return
         }
 
@@ -421,8 +432,14 @@ class HomeFragment : Fragment() {
         }
 
         val customName = sensor.name?.trim()?.takeIf { it.isNotEmpty() }
+        val isCox = sensor.role == SensorRole.COX
         val seatView = TextView(context).apply {
-            text = if (customName == null) "Seat $seatIndex" else "Seat $seatIndex - $customName"
+            text = when {
+                isCox && customName != null -> "$COX_INDICATOR Cox - $customName"
+                isCox -> "$COX_INDICATOR Cox"
+                customName == null -> "Seat $seatIndex"
+                else -> "Seat $seatIndex - $customName"
+            }
             textSize = 16f
             setPadding(0, 0, 16, 0)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -450,17 +467,22 @@ class HomeFragment : Fragment() {
         }
         bubble.addView(statusView)
 
+        // Seed cox with final text; rowers get the "-- ms" placeholder that the live poll
+        // will replace. Avoids a single-frame flicker where cox briefly shows an empty
+        // lateness value that contradicts its role.
         val latenessView = TextView(context).apply {
-            text = "Lateness vs Stroke: -- ms"
+            text = if (isCox) "Hull reference (no stroke)" else "Lateness vs Stroke: -- ms"
             textSize = 13f
             setPadding(0, 10, 0, 0)
         }
         bubble.addView(latenessView)
-        bubble.addView(TextView(context).apply {
-            text = "Technique: --/100"
-            textSize = 13f
-            setPadding(0, 6, 0, 0)
-        })
+        if (!isCox) {
+            bubble.addView(TextView(context).apply {
+                text = "Technique: --/100"
+                textSize = 13f
+                setPadding(0, 6, 0, 0)
+            })
+        }
 
         return bubble to SweepRowRef(
             status = statusView,

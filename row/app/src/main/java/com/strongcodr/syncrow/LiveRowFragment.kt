@@ -76,6 +76,14 @@ class LiveRowFragment : Fragment() {
 
             val avg = if (spmCount > 0) spmSum / spmCount else 0
             binding.textLiveSummary.text = "Crew Avg SPM: $avg | Sync spread: -- | Technique consistency: --"
+
+            // Cox connection status — separate from the rower loop above.
+            coxSensorMac?.let { mac ->
+                val connected = prefs.getBoolean(connectedKey(mac), false)
+                val status = prefs.getString(statusKey(mac), "DISCONNECTED") ?: "DISCONNECTED"
+                coxStatusView?.text = displayStatus(running, connected, status)
+            }
+
             handler.postDelayed(this, 200L)
         }
     }
@@ -98,6 +106,11 @@ class LiveRowFragment : Fragment() {
     )
 
     private val rowViews = ConcurrentHashMap<Long, RowViews>()
+
+    // Cox has no stroke/SPM/lateness — we only need to reflect connection state on its
+    // card. Tracked separately so the normal per-rower RowViews loop stays homogeneous.
+    private var coxStatusView: android.widget.TextView? = null
+    private var coxSensorMac: String? = null
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         _binding = FragmentLiveRowBinding.inflate(inflater, container, false)
@@ -267,6 +280,8 @@ class LiveRowFragment : Fragment() {
     private fun rebuildRows(sensors: List<Sensor>) {
         val b = _binding ?: return
         rowViews.clear()
+        coxStatusView = null
+        coxSensorMac = null
         b.containerSensors.removeAllViews()
         val mode = RowingModeStore.getUiMode(requireContext())
         b.labelSensors.text = if (mode == RowingMode.SWEEP) "Mode: Sweep | Stroke reference: Seat ${sensors.size}" else "Mode: Sculling | Stroke reference: Seat ${(sensors.size + 1) / 2}"
@@ -288,13 +303,22 @@ class LiveRowFragment : Fragment() {
     }
 
     private fun buildSweepRows(sensors: List<Sensor>, b: FragmentLiveRowBinding) {
-        val total = sensors.size
-        sensors.forEachIndexed { idx, sensor ->
-            val seatNumber = total - idx
+        val rowerCount = sensors.count { it.role == SensorRole.SEAT }
+        var rowerIdx = 0
+        sensors.forEach { sensor ->
+            val isCox = sensor.role == SensorRole.COX
+            val seatNumber = if (isCox) {
+                0
+            } else {
+                val n = rowerCount - rowerIdx
+                rowerIdx++
+                n
+            }
             val card = buildCard()
             val displayName = sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: sensor.mac
             val title = TextView(requireContext()).apply {
-                text = "Seat $seatNumber - $displayName"
+                text = if (isCox) "$COX_INDICATOR Cox - $displayName"
+                    else "Seat $seatNumber - $displayName"
                 textSize = 18f
             }
             val status = TextView(requireContext()).apply {
@@ -302,20 +326,25 @@ class LiveRowFragment : Fragment() {
                 textSize = 14f
             }
             val spm = TextView(requireContext()).apply {
-                text = "SPM: --"
+                // Cox doesn't row — no strokes, no rate. Seed with the final text so we
+                // never show a misleading "-- spm" that would look like a missing update.
+                text = if (isCox) "Hull reference (no stroke)" else "SPM: --"
                 textSize = 16f
             }
             val strokes = TextView(requireContext()).apply {
-                text = "Strokes: 0"
+                text = if (isCox) "" else "Strokes: 0"
                 textSize = 16f
+                if (isCox) visibility = View.GONE
             }
             val lateness = TextView(requireContext()).apply {
-                text = "Lateness vs Stroke: -- ms"
+                text = if (isCox) "" else "Lateness vs Stroke: -- ms"
                 textSize = 13f
+                if (isCox) visibility = View.GONE
             }
             val technique = TextView(requireContext()).apply {
-                text = "Technique score: --"
+                text = if (isCox) "" else "Technique score: --"
                 textSize = 13f
+                if (isCox) visibility = View.GONE
             }
 
             val inner = LinearLayout(requireContext()).apply {
@@ -329,7 +358,14 @@ class LiveRowFragment : Fragment() {
             }
             card.addView(inner)
             b.containerSensors.addView(card)
-            rowViews[sensor.id] = RowViews(status, spm, strokes, lateness)
+            // Only track rower rows for live updates. Cox has nothing per-tick to show
+            // beyond connection state, and its status TextView is wired below.
+            if (!isCox) {
+                rowViews[sensor.id] = RowViews(status, spm, strokes, lateness)
+            } else {
+                coxStatusView = status
+                coxSensorMac = sensor.mac
+            }
         }
     }
 

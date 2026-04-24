@@ -184,6 +184,44 @@ class ManageSensorsFragment : Fragment() {
         val container = binding.containerSculling
         container.removeAllViews()
 
+        // Cox lives outside the port/starboard layout — render it as its own card above
+        // the seats. toScullingSeats already filters cox out.
+        sensors.firstOrNull { it.role == SensorRole.COX }?.let { cox ->
+            val card = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.VERTICAL
+                background = ContextCompat.getDrawable(requireContext(), R.drawable.bg_sensor_bubble)
+                setPadding(24, 18, 24, 18)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, 12, 0, 0) }
+            }
+            val custom = cox.name?.trim().orEmpty()
+            val titleText = if (custom.isNotEmpty()) "$COX_INDICATOR $custom (Cox)"
+                else "$COX_INDICATOR Cox"
+            card.addView(TextView(requireContext()).apply {
+                text = titleText
+                textSize = 18f
+            })
+            val menuRow = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 8, 0, 0)
+            }
+            menuRow.addView(TextView(requireContext()).apply {
+                text = "Hull-mounted IMU"
+                textSize = 12f
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            menuRow.addView(ImageButton(requireContext()).apply {
+                setImageResource(android.R.drawable.ic_menu_more)
+                background = null
+                contentDescription = "Cox sensor options"
+                setOnClickListener { view -> showSensorMenu(view, cox) }
+            })
+            card.addView(menuRow)
+            container.addView(card)
+        }
+
         val seats = CrewLayout.toScullingSeats(sensors)
         seats.forEach { seat ->
             val seatHighlighted = seat.port?.id == highlightedScullingSensorId ||
@@ -352,11 +390,12 @@ class ManageSensorsFragment : Fragment() {
 
     private fun showSensorMenu(anchor: View, sensor: Sensor) {
         val popup = PopupMenu(requireContext(), anchor)
-        if (currentMode == RowingMode.SCULLING) {
+        if (currentMode == RowingMode.SCULLING && sensor.role == SensorRole.SEAT) {
             popup.menu.add("Swap Port/Starboard")
             popup.menu.add("Swap with...")
         }
         popup.menu.add("Rename")
+        popup.menu.add(if (sensor.role == SensorRole.COX) "Unmark as Cox" else "Mark as Cox")
         popup.menu.add("Remove")
 
         popup.setOnMenuItemClickListener { item ->
@@ -371,6 +410,14 @@ class ManageSensorsFragment : Fragment() {
                 }
                 "Rename" -> {
                     showRenameDialog(sensor)
+                    true
+                }
+                "Mark as Cox" -> {
+                    sensorsViewModel.setRole(sensor.id, SensorRole.COX)
+                    true
+                }
+                "Unmark as Cox" -> {
+                    sensorsViewModel.setRole(sensor.id, SensorRole.SEAT)
                     true
                 }
                 "Remove" -> {
@@ -529,11 +576,13 @@ class SensorsAdapter(
 ) : RecyclerView.Adapter<SensorsAdapter.SensorViewHolder>() {
 
     private val items: MutableList<Sensor> = mutableListOf()
+    private val seatNumberByPosition: MutableList<Int> = mutableListOf()
     private var highlightedId: Long? = null
 
     fun submitList(newItems: List<Sensor>) {
         items.clear()
         items.addAll(newItems)
+        rebuildSeatNumbers()
         notifyDataSetChanged()
     }
 
@@ -545,7 +594,24 @@ class SensorsAdapter(
 
         val item = items.removeAt(fromPos)
         items.add(toPos, item)
+        rebuildSeatNumbers()
         notifyItemMoved(fromPos, toPos)
+    }
+
+    /** Precompute per-position seat numbers so onBindViewHolder stays O(1).
+     *  Cox positions get 0 as a sentinel (rendered as "Cox" in the holder bind). */
+    private fun rebuildSeatNumbers() {
+        seatNumberByPosition.clear()
+        val rowerCount = items.count { it.role == SensorRole.SEAT }
+        var rowerIdx = 0
+        items.forEach { sensor ->
+            if (sensor.role == SensorRole.COX) {
+                seatNumberByPosition.add(0)
+            } else {
+                seatNumberByPosition.add(rowerCount - rowerIdx)
+                rowerIdx++
+            }
+        }
     }
 
     fun setHighlightedId(id: Long?) {
@@ -568,7 +634,7 @@ class SensorsAdapter(
     override fun onBindViewHolder(holder: SensorViewHolder, position: Int) {
         val sensor = items[position]
         val isHighlighted = sensor.id == highlightedId
-        val seatNumber = items.size - position
+        val seatNumber = seatNumberByPosition.getOrElse(position) { 0 }
         holder.bind(seatNumber, sensor, isHighlighted, onMenuClick, onRowClick)
     }
 
@@ -588,7 +654,12 @@ class SensorsAdapter(
             onRowClick: (Sensor) -> Unit
         ) {
             val custom = sensor.name?.trim().orEmpty()
-            seatView.text = if (custom.isNotEmpty()) custom else "Seat $seatIndex"
+            seatView.text = when {
+                sensor.role == SensorRole.COX && custom.isNotEmpty() -> "$COX_INDICATOR $custom (Cox)"
+                sensor.role == SensorRole.COX -> "$COX_INDICATOR Cox"
+                custom.isNotEmpty() -> custom
+                else -> "Seat $seatIndex"
+            }
             nameView.visibility = View.GONE
 
             rootRow.setBackgroundResource(

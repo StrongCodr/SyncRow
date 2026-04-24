@@ -15,16 +15,28 @@ class SensorsViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         val loaded = SensorsStore.load(application)
-        val sanitized = loaded.map { s ->
-            val n = s.name?.trim()
-            // Don’t keep default WIT broadcast names like "WT..." as a saved label.
-            val shouldClear = n != null && n.startsWith("WT", ignoreCase = true)
-            if (shouldClear) s.copy(name = null) else s
-        }
+        val sanitized = sanitizeLoaded(loaded)
         _sensors.value = sanitized
         nextId = (sanitized.maxOfOrNull { it.id } ?: 0L) + 1
         if (sanitized != loaded) {
             SensorsStore.save(application, sanitized)
+        }
+    }
+
+    private fun sanitizeLoaded(loaded: List<Sensor>): List<Sensor> {
+        // Clear WIT broadcast names ("WT...") from saved labels.
+        val nameCleaned = loaded.map { s ->
+            val n = s.name?.trim()
+            if (n != null && n.startsWith("WT", ignoreCase = true)) s.copy(name = null) else s
+        }
+        // Enforce the single-cox invariant on load — if the JSON file got hand-edited or
+        // a prior race produced multiple cox entries, keep the first and demote the rest.
+        // Without this, remapSensorsForModeSwitch would silently drop the extras.
+        var seenCox = false
+        return nameCleaned.map { s ->
+            if (s.role == SensorRole.COX) {
+                if (seenCox) s.copy(role = SensorRole.SEAT) else { seenCox = true; s }
+            } else s
         }
     }
 
@@ -78,4 +90,48 @@ class SensorsViewModel(application: Application) : AndroidViewModel(application)
         _sensors.value = emptyList()
         SensorsStore.save(getApplication(), emptyList())
     }
+
+    /**
+     * Set the role for a sensor.
+     * - Marking as COX: unmarks any existing cox (single-cox invariant), then moves the
+     *   new cox to index 0 so rendering and seat numbering flow naturally.
+     * - Demoting from COX back to SEAT: moves the former cox to the END of the list
+     *   (next to stroke, seatIndex=1). This avoids silently promoting the sensor to
+     *   bow, which is what would happen if we left it at index 0 after demotion.
+     */
+    fun setRole(id: Long, role: SensorRole) {
+        val current = _sensors.value ?: return
+        if (current.none { it.id == id }) return
+
+        val updated = when (role) {
+            SensorRole.COX -> {
+                val cleared = current.map { s ->
+                    when {
+                        s.id == id -> s.copy(role = SensorRole.COX)
+                        s.role == SensorRole.COX -> s.copy(role = SensorRole.SEAT)
+                        else -> s
+                    }
+                }
+                val cox = cleared.first { it.id == id }
+                val others = cleared.filter { it.id != id }
+                listOf(cox) + others
+            }
+            SensorRole.SEAT -> {
+                val target = current.first { it.id == id }
+                val wasCox = target.role == SensorRole.COX
+                val demoted = target.copy(role = SensorRole.SEAT)
+                if (wasCox) {
+                    // Move to end (stroke position) rather than leaving at index 0 (bow).
+                    current.filter { it.id != id } + demoted
+                } else {
+                    current.map { s -> if (s.id == id) demoted else s }
+                }
+            }
+        }
+
+        _sensors.postValue(updated)
+        SensorsStore.save(getApplication(), updated)
+    }
+
+    fun coxSensor(): Sensor? = _sensors.value?.firstOrNull { it.role == SensorRole.COX }
 }

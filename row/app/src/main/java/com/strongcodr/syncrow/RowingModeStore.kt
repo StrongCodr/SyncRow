@@ -15,8 +15,10 @@ enum class RowingMode {
  * - Recording effective mode: how sensor identity is represented for interval recording and uploads.
  *
  * Compatibility contract (do not break):
- * - Upload identity MUST remain legacy "Seat N" for sensor_id in all modes.
+ * - Rower upload identity MUST remain legacy "Seat N" for sensor_id in all modes.
  * - Sculling "Port/Starboard" is a UI and local mapping detail only.
+ * - Cox (hull-mounted IMU, role=COX) uses sensor_id/seat="Cox" — intentionally outside
+ *   the "Seat N" range to make analytics queries unambiguous.
  *
  * Why this exists:
  * Downstream ingestion and analytics assume legacy sensor_id format. Changing sensor_id to include
@@ -64,16 +66,19 @@ object CrewLayout {
     }
 
     fun toScullingSeats(sensors: List<Sensor>): List<ScullingSeat> {
-        if (sensors.isEmpty()) return emptyList()
+        // Cox is not a rowing seat — exclude it from the pair-up layout. Caller is
+        // responsible for rendering cox separately (or not at all).
+        val rowers = sensors.filter { it.role == SensorRole.SEAT }
+        if (rowers.isEmpty()) return emptyList()
 
-        val seatCount = (sensors.size + 1) / 2
+        val seatCount = (rowers.size + 1) / 2
         val seats = mutableListOf<ScullingSeat>()
 
         var idx = 0
         var seatNumber = seatCount
-        while (idx < sensors.size) {
-            val port = sensors.getOrNull(idx)
-            val starboard = sensors.getOrNull(idx + 1)
+        while (idx < rowers.size) {
+            val port = rowers.getOrNull(idx)
+            val starboard = rowers.getOrNull(idx + 1)
             seats += ScullingSeat(
                 seatNumber = seatNumber,
                 port = port,
@@ -96,31 +101,36 @@ object CrewLayout {
         // Defensive normalization: preserve first occurrence order and ignore accidental duplicates.
         val normalized = sensors.distinctBy { it.id }
 
-        return when {
+        // Split off cox before remapping — cox doesn't participate in port/starboard or
+        // pair-up logic. It rides along at the head of the result regardless of mode.
+        val cox = normalized.firstOrNull { it.role == SensorRole.COX }
+        val rowers = normalized.filter { it.role == SensorRole.SEAT }
+
+        val remappedRowers = when {
             from == RowingMode.SCULLING && to == RowingMode.SWEEP -> {
-                // Explicitly flatten by seat (highest to lowest), Port then Starboard.
                 val flattened = mutableListOf<Sensor>()
-                toScullingSeats(normalized).forEach { seat ->
+                // toScullingSeats already filters out cox; re-pass rowers-only to be explicit.
+                toScullingSeats(rowers).forEach { seat ->
                     if (seat.port != null) flattened += seat.port
                     if (seat.starboard != null) flattened += seat.starboard
                 }
                 flattened
             }
             from == RowingMode.SWEEP && to == RowingMode.SCULLING -> {
-                // Explicitly pair consecutive sweep seats: high->Port, low->Starboard.
-                // Odd count: final sensor becomes Port of the lowest sculling seat.
                 val paired = mutableListOf<Sensor>()
                 var idx = 0
-                while (idx < normalized.size) {
-                    val high = normalized[idx]
+                while (idx < rowers.size) {
+                    val high = rowers[idx]
                     paired += high
-                    val low = normalized.getOrNull(idx + 1)
+                    val low = rowers.getOrNull(idx + 1)
                     if (low != null) paired += low
                     idx += 2
                 }
                 paired
             }
-            else -> normalized
+            else -> rowers
         }
+
+        return if (cox != null) listOf(cox) + remappedRowers else remappedRowers
     }
 }

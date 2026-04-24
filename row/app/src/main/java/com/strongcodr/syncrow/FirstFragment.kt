@@ -256,12 +256,6 @@ class FirstFragment : Fragment() {
             appendLog("Connected to $name.")
         }
 
-        val current = sensorsViewModel.sensors.value.orEmpty()
-        val legacyIds = current.mapIndexed { idx, _ -> "Seat ${current.size - idx}" }
-        if (DEBUG_BLE) {
-            Log.d("SYNCROW", "Pairing proof: current legacy sensor_id labels=$legacyIds")
-        }
-
         // After confirming, go back to Manage Sensors
         findNavController().popBackStack()
     }
