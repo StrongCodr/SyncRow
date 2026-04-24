@@ -29,10 +29,12 @@ import com.strongcodr.syncrow.model.IntervalUpload
 import com.strongcodr.syncrow.model.LocationSample
 import com.strongcodr.syncrow.model.LocationUpload
 import com.strongcodr.syncrow.model.SeatSummary
+import com.strongcodr.syncrow.model.SensorDiagnostic
 import com.strongcodr.syncrow.model.SessionSummary
 import com.strongcodr.syncrow.model.SensorSample
 import com.strongcodr.syncrow.model.SyncStatus
 import com.strongcodr.syncrow.network.ApiClient
+import com.strongcodr.syncrow.storage.DiagnosticsStore
 import com.strongcodr.syncrow.storage.IntervalIndexStore
 import com.strongcodr.syncrow.storage.IntervalNamesStore
 import kotlin.math.abs
@@ -53,6 +55,7 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -96,6 +99,7 @@ class IntervalRecordingService : Service() {
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
         private fun latenessKey(mac: String) = "live_lateness_$mac"
+        fun hzKey(mac: String) = "live_hz_$mac"
 
         private val nextIntervalId = AtomicLong(System.currentTimeMillis())
 
@@ -256,20 +260,21 @@ class IntervalRecordingService : Service() {
         var lastDisconnectNotifMs: Long = 0L,
         var connectInFlight: Boolean = false,
         var lastConnectAttemptElapsedMs: Long = 0L,
-        var timeout147Count: Int = 0
+        var timeout147Count: Int = 0,
+        val reconnectsThisWindow: AtomicInteger = AtomicInteger(0)
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var prefs: SharedPreferences
     private val processStartElapsedMs: Long = SystemClock.elapsedRealtime()
 
-    private var intervalRunning = false
-    private var serviceActive = false
+    @Volatile private var intervalRunning = false
+    @Volatile private var serviceActive = false
     private var serviceInForeground = false
 
     private val activeSensors = mutableMapOf<String, ActiveSensor>() // key: mac
     private val strokeAnalyzer = StrokeAnalyzer()
-    private var sessionIntervalId: Long = -1L
+    @Volatile private var sessionIntervalId: Long = -1L
     private var healthMonitorActive = false
     private val pendingUploadActive = AtomicBoolean(false)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -453,6 +458,7 @@ class IntervalRecordingService : Service() {
 
         startHealthMonitorIfNeeded()
         startSamplingLoopIfNeeded()
+        startDiagnosticsLoopIfNeeded()
         startLocationUpdatesIfNeeded()
 
         val incomingMacs = sensors.map { it.mac }.toSet()
@@ -527,6 +533,7 @@ class IntervalRecordingService : Service() {
             .apply()
 
         startHealthMonitorIfNeeded()
+        startDiagnosticsLoopIfNeeded()
 
         val incomingMacs = sensors.map { it.mac }.toSet()
         activeSensors.values.filter { it.mac !in incomingMacs }.forEach { it.client.disconnect() }
@@ -615,6 +622,7 @@ class IntervalRecordingService : Service() {
         locationPayload?.let { saveLocationLocally(it) }
 
         // Write a single interval meta entry for the whole session (even with multiple sensors)
+        val diagFileExists = DiagnosticsStore.readInterval(this, sessionId).isNotEmpty()
         IntervalIndexStore.upsert(
             this,
             IntervalMeta(
@@ -622,7 +630,8 @@ class IntervalRecordingService : Service() {
                 startTimeMillis = intervalStartWallMs,
                 endTimeMillis = intervalStartWallMs + durationMs,
                 syncStatus = SyncStatus.SYNCING,
-                locationSyncStatus = if (locationPayload != null) SyncStatus.SYNCING else null
+                locationSyncStatus = if (locationPayload != null) SyncStatus.SYNCING else null,
+                diagSyncStatus = if (diagFileExists) SyncStatus.SYNCING else null
             )
         )
 
@@ -796,6 +805,62 @@ class IntervalRecordingService : Service() {
             }
         }
 
+        if (diagFileExists) {
+            scope.launch {
+                val canUpload = hasInternetNow()
+                if (!canUpload) {
+                    IntervalIndexStore.updateDiagStatus(
+                        this@IntervalRecordingService,
+                        sessionId,
+                        SyncStatus.SYNCING
+                    )
+                    return@launch
+                }
+
+                val rows = try {
+                    DiagnosticsStore.readInterval(this@IntervalRecordingService, sessionId)
+                } catch (e: Exception) {
+                    Log.e("SYNCROW", "Diag read failed: ${e.message}", e)
+                    emptyList()
+                }
+                if (rows.isEmpty()) {
+                    IntervalIndexStore.updateDiagStatus(
+                        this@IntervalRecordingService,
+                        sessionId,
+                        SyncStatus.SYNCED
+                    )
+                    return@launch
+                }
+
+                val intervalLabel = IntervalNamesStore.get(this@IntervalRecordingService, sessionId)
+                    ?: "Interval_${sessionId}"
+
+                val (success, code) = try {
+                    ApiClient.uploadDiagnostics(rows, intervalLabel)
+                } catch (e: Exception) {
+                    Log.e("SYNCROW", "Diag upload threw: ${e.javaClass.simpleName}: ${e.message}", e)
+                    Pair(false, -1)
+                }
+
+                Log.e(
+                    "SYNCROW",
+                    "Diag upload finished: success=$success rows=${rows.size} intervalId=$sessionId"
+                )
+
+                val retryable = code == 429
+                val newStatus = when {
+                    success -> SyncStatus.SYNCED
+                    retryable -> SyncStatus.SYNCING
+                    else -> SyncStatus.FAILED
+                }
+                IntervalIndexStore.updateDiagStatus(
+                    this@IntervalRecordingService,
+                    sessionId,
+                    newStatus
+                )
+            }
+        }
+
         maybeRunDeferredSoftResetAfterStop()
     }
 
@@ -936,6 +1001,7 @@ class IntervalRecordingService : Service() {
                     onDisconnected = {
                         sensor.connectInFlight = false
                         sensor.connected = false
+                        sensor.reconnectsThisWindow.incrementAndGet()
                         if (appIsForeground) prefs.edit()
                             .putString(statusKey(sensor.mac), "DISCONNECTED (reconnecting…)").apply()
                         prefs.edit().putBoolean(connectedKey(sensor.mac), false).apply()
@@ -1004,7 +1070,7 @@ class IntervalRecordingService : Service() {
                         locationSnapshot.copy(timestampMs = nowWall)
                     )
                 }
-                activeSensors.values.forEach { sensor ->
+                activeSensors.values.toList().forEach { sensor ->
                     val latest = sensor.latestSample ?: return@forEach
                     if (!sensor.connected) return@forEach
                     if (sensor.latestSampleMs < intervalStartWallMs) return@forEach
@@ -1052,6 +1118,180 @@ class IntervalRecordingService : Service() {
     private fun stopSamplingLoop() {
         samplingJob?.cancel()
         samplingJob = null
+    }
+
+    private var diagnosticsJob: Job? = null
+
+    private fun startDiagnosticsLoopIfNeeded() {
+        if (diagnosticsJob?.isActive == true) return
+        diagnosticsJob = scope.launch {
+            val rssiPeriodMs = 5_000L           // RSSI every 5s; polling at 1 Hz × N sensors competes with sample events.
+            val maxCleanWindowMs = 5_000L       // beyond this (Doze, GC pause), drop the tick — faking a 1s window lies.
+            var lastRssiReadElapsedMs = 0L
+            var prevTickElapsedMs = 0L
+            while (serviceActive) {
+                // Snap ticks to whole-second wall-clock boundaries so multi-sensor rows
+                // for the same second land on the same InfluxDB timestamp.
+                val nowWall = System.currentTimeMillis()
+                val nextTickWall = ((nowWall / 1000L) + 1L) * 1000L
+                delay((nextTickWall - nowWall).coerceAtLeast(0L))
+                if (!serviceActive) break
+
+                try {
+                    runDiagnosticsTick(
+                        prevTickElapsedMs = prevTickElapsedMs,
+                        maxCleanWindowMs = maxCleanWindowMs,
+                        rssiPeriodMs = rssiPeriodMs,
+                        lastRssiReadElapsedMs = lastRssiReadElapsedMs
+                    ).let { result ->
+                        prevTickElapsedMs = result.newPrevTickElapsedMs
+                        lastRssiReadElapsedMs = result.newLastRssiReadElapsedMs
+                    }
+                } catch (e: Throwable) {
+                    // Never let a stray exception kill the loop. Reset prev tick so the next
+                    // row is flagged as a gap rather than compared against a stale baseline.
+                    Log.e("SYNCROW", "Diagnostics tick threw: ${e.javaClass.simpleName}: ${e.message}", e)
+                    prevTickElapsedMs = 0L
+                }
+            }
+            diagnosticsJob = null
+        }
+    }
+
+    private data class TickResult(
+        val newPrevTickElapsedMs: Long,
+        val newLastRssiReadElapsedMs: Long
+    )
+
+    private fun runDiagnosticsTick(
+        prevTickElapsedMs: Long,
+        maxCleanWindowMs: Long,
+        rssiPeriodMs: Long,
+        lastRssiReadElapsedMs: Long
+    ): TickResult {
+        val tickWallMs = System.currentTimeMillis()
+        val tickElapsedMs = SystemClock.elapsedRealtime()
+
+        // Actual window length since the previous tick. If the coroutine was paused
+        // (Doze, long GC, etc.) for longer than maxCleanWindowMs, emitting a row would
+        // produce a wildly inaccurate drop% — reset the baseline and skip this tick.
+        val rawDeltaMs = if (prevTickElapsedMs == 0L) 1000L else tickElapsedMs - prevTickElapsedMs
+        if (rawDeltaMs > maxCleanWindowMs) {
+            Log.w("SYNCROW", "Diagnostics tick gap ${rawDeltaMs}ms — dropping row, resetting baseline")
+            return TickResult(
+                newPrevTickElapsedMs = tickElapsedMs,
+                newLastRssiReadElapsedMs = lastRssiReadElapsedMs
+            )
+        }
+        val windowDurationMs = rawDeltaMs
+
+        val expectedHzWhole = BleDeviceClient.expectedHzFor(BleDeviceClient.targetRateRegister)
+        // Round instead of truncate: 100 Hz × 999 ms = 99.9 should report expected=100, not 99.
+        val expectedThisWindow = Math.round(expectedHzWhole * windowDurationMs / 1000.0).toInt()
+
+        val captureIntervalRunning = intervalRunning
+        val captureSessionId = if (captureIntervalRunning) sessionIntervalId else -1L
+
+        val sensors = activeSensors.values.toList()
+
+        val newLastRssiReadElapsedMs = if (tickElapsedMs - lastRssiReadElapsedMs >= rssiPeriodMs) {
+            sensors.forEach { if (it.connected) it.client.requestRssiRead() }
+            tickElapsedMs
+        } else lastRssiReadElapsedMs
+
+        // Build rows with per-sensor isolation — one misbehaving sensor must not nuke
+        // the whole tick. Failed sensors drop out of this tick's output silently; the
+        // catch will log once per failure.
+        val rows = sensors.mapNotNull { s ->
+            try {
+                buildDiagnosticRow(s, tickWallMs, tickElapsedMs, windowDurationMs,
+                    expectedThisWindow, captureIntervalRunning, captureSessionId)
+            } catch (e: Throwable) {
+                Log.e("SYNCROW", "Diagnostic row build failed mac=${bleMacForLog(s.mac)}: ${e.message}", e)
+                null
+            }
+        }
+
+        // Update the existing hzKey prefs so LiveRow/ManageSensors status still works.
+        // Skip disconnected sensors — writing 0 Hz every second is noise, and the disconnect
+        // paths already zero hzKey via the health monitor.
+        if (rows.isNotEmpty()) {
+            val editor = prefs.edit()
+            var dirty = false
+            rows.forEach { r ->
+                if (r.connected) {
+                    editor.putFloat(hzKey(r.sensorMac), r.received.toFloat())
+                    dirty = true
+                }
+            }
+            if (dirty) editor.apply()
+        }
+
+        try {
+            DiagnosticsStore.writeLatest(this@IntervalRecordingService, rows)
+        } catch (e: Exception) {
+            // Promote to unconditional ERROR — in release builds a full disk or permissions
+            // regression would otherwise silently stall the diag screen with stale data.
+            Log.e("SYNCROW", "DiagnosticsStore.writeLatest failed: ${e.message}", e)
+        }
+
+        if (captureIntervalRunning && captureSessionId != -1L && rows.isNotEmpty()) {
+            try {
+                DiagnosticsStore.appendInterval(
+                    this@IntervalRecordingService,
+                    captureSessionId,
+                    rows
+                )
+            } catch (e: Exception) {
+                Log.e("SYNCROW", "DiagnosticsStore.appendInterval failed: ${e.message}", e)
+            }
+        }
+
+        return TickResult(
+            newPrevTickElapsedMs = tickElapsedMs,
+            newLastRssiReadElapsedMs = newLastRssiReadElapsedMs
+        )
+    }
+
+    private fun buildDiagnosticRow(
+        s: ActiveSensor,
+        tickWallMs: Long,
+        tickElapsedMs: Long,
+        windowDurationMs: Long,
+        expectedThisWindow: Int,
+        captureIntervalRunning: Boolean,
+        captureSessionId: Long
+    ): SensorDiagnostic {
+        val snap = s.client.snapshotAndReset()
+        val received = snap.received
+        // Signed drop %: negative means surplus. Preserve the sign so misconfigured rates
+        // surface instead of being silently clamped to zero.
+        val dropPct = if (expectedThisWindow > 0) {
+            (expectedThisWindow - received) * 100.0 / expectedThisWindow
+        } else 0.0
+        val reconnects = s.reconnectsThisWindow.getAndSet(0)
+
+        return SensorDiagnostic(
+            timestampMs = tickWallMs,
+            elapsedMs = tickElapsedMs,
+            windowDurationMs = windowDurationMs,
+            sensorMac = s.mac,
+            sensorId = if (captureIntervalRunning) s.id else null,
+            seat = s.seat,
+            intervalId = captureSessionId,
+            expected = expectedThisWindow,
+            received = received,
+            dropPct = dropPct,
+            maxGapMs = snap.maxGapMs,
+            jitterMs = snap.jitterMs,
+            malformed = snap.malformed,
+            rssi = snap.rssi,
+            connected = s.connected,
+            configApplied = snap.configApplied,
+            configFailed = snap.configFailed,
+            reconnectsThisWindow = reconnects,
+            lastGattStatus = snap.lastGattStatus
+        )
     }
 
     private fun hasLocationPermission(): Boolean {
@@ -1150,10 +1390,12 @@ class IntervalRecordingService : Service() {
 
         scope.launch {
             val timeoutMs = 2_000L
+            var lastPriorityReassertMs = 0L
+            val priorityReassertIntervalMs = 5_000L
             while (serviceActive) {
                 delay(500L)
                 val now = System.currentTimeMillis()
-                activeSensors.values.forEach { sensor ->
+                activeSensors.values.toList().forEach { sensor ->
                     if (!sensor.connected) return@forEach
                     val lastSeen = sensor.lastSeenSampleMs
                     if (lastSeen == 0L) return@forEach
@@ -1163,10 +1405,21 @@ class IntervalRecordingService : Service() {
                     prefs.edit()
                         .putString(statusKey(sensor.mac), "DISCONNECTED (reconnecting…)")
                         .putBoolean(connectedKey(sensor.mac), false)
+                        .putFloat(hzKey(sensor.mac), 0f)
                         .apply()
                     setOngoingNotification("DISCONNECTED • reconnecting…")
                     maybeNotifySensorDisconnected(sensor)
                     startReconnectLoop(sensor)
+                }
+
+                // Android silently drops back to BALANCED connection priority after idle / low
+                // battery. Re-assert HIGH every 5s on connected sensors to hold the short
+                // connection interval that gives us 100+ Hz headroom.
+                if (now - lastPriorityReassertMs >= priorityReassertIntervalMs) {
+                    lastPriorityReassertMs = now
+                    activeSensors.values.toList().forEach { sensor ->
+                        if (sensor.connected) sensor.client.reassertConnectionPriority()
+                    }
                 }
             }
             healthMonitorActive = false
@@ -1715,6 +1968,56 @@ class IntervalRecordingService : Service() {
                                 meta.id,
                                 SyncStatus.FAILED
                             )
+                        }
+                    }
+
+                    // Diagnostics upload — lower priority: only retry if IMU/location didn't hit
+                    // rate-limit this pass, and only if the diag file exists and isn't already SYNCED.
+                    if (!anyRetryable &&
+                        meta.diagSyncStatus != null &&
+                        meta.diagSyncStatus != SyncStatus.SYNCED
+                    ) {
+                        val diagRows = try {
+                            DiagnosticsStore.readInterval(this@IntervalRecordingService, meta.id)
+                        } catch (e: Exception) {
+                            Log.e("SYNCROW", "Diag read failed: ${e.message}", e)
+                            emptyList()
+                        }
+                        if (diagRows.isEmpty()) {
+                            // File missing/empty — mark synced so we stop retrying.
+                            IntervalIndexStore.updateDiagStatus(
+                                this@IntervalRecordingService,
+                                meta.id,
+                                SyncStatus.SYNCED
+                            )
+                        } else {
+                            val (success, code) = try {
+                                ApiClient.uploadDiagnostics(diagRows, intervalLabel)
+                            } catch (e: Exception) {
+                                Log.e("SYNCROW", "Deferred diag upload failed: ${e.javaClass.simpleName}: ${e.message}", e)
+                                Pair(false, -1)
+                            }
+                            if (success) {
+                                IntervalIndexStore.updateDiagStatus(
+                                    this@IntervalRecordingService,
+                                    meta.id,
+                                    SyncStatus.SYNCED
+                                )
+                            } else if (code == 429) {
+                                anyRetryable = true
+                                IntervalIndexStore.updateDiagStatus(
+                                    this@IntervalRecordingService,
+                                    meta.id,
+                                    SyncStatus.SYNCING
+                                )
+                            } else {
+                                // Don't fail the whole interval over diagnostics.
+                                IntervalIndexStore.updateDiagStatus(
+                                    this@IntervalRecordingService,
+                                    meta.id,
+                                    SyncStatus.FAILED
+                                )
+                            }
                         }
                     }
 

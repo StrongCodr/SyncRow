@@ -164,11 +164,13 @@ class IntervalsFragment : Fragment() {
         }
 
         val duration = formatDuration(meta.endTimeMillis - meta.startTimeMillis)
-        val sensorStatus = statusText(meta.syncStatus, meta.lastSensorSyncAt)
-        val locationStatus = statusText(meta.locationSyncStatus, meta.lastLocationSyncAt)
+        // Collapse to a single "All synced" line when all present statuses agree, to keep
+        // the subtitle from growing to 4 concatenated clauses on narrow phones. Fall back
+        // to per-channel breakdown when any diverge.
+        val subtitleText = buildSyncSubtitle(duration, meta)
 
         val subtitle = TextView(requireContext()).apply {
-            text = "Duration $duration • Sensor: $sensorStatus • Location: $locationStatus"
+            text = subtitleText
             textSize = 13f
         }
 
@@ -313,6 +315,8 @@ class IntervalsFragment : Fragment() {
         // summary
         File(dir, "summary_${intervalId}.json").delete()
         File(dir, "location_${intervalId}.json").delete()
+        // diagnostics JSONL for this interval
+        File(dir, "diag_${intervalId}.jsonl").delete()
 
         // payloads (new format: interval_<id>_<sensor>.json)
         dir.listFiles()?.forEach { f ->
@@ -323,6 +327,25 @@ class IntervalsFragment : Fragment() {
             if (f.name == "interval_${intervalId}.json") {
                 f.delete()
             }
+        }
+    }
+
+    private fun buildSyncSubtitle(duration: String, meta: IntervalMeta): String {
+        // Collect (label, status, lastSyncAt) for every channel present on this interval.
+        // Older intervals may have null diagSyncStatus — we include only populated channels.
+        data class Channel(val label: String, val status: SyncStatus, val lastSyncAt: Long?)
+        val channels = buildList {
+            add(Channel("Sensor", meta.syncStatus, meta.lastSensorSyncAt))
+            meta.locationSyncStatus?.let { add(Channel("Location", it, meta.lastLocationSyncAt)) }
+            meta.diagSyncStatus?.let { add(Channel("Diag", it, meta.lastDiagSyncAt)) }
+        }
+        val distinctStatuses = channels.map { it.status }.toSet()
+        return if (distinctStatuses.size == 1) {
+            val unified = statusText(distinctStatuses.single(), channels.maxOf { it.lastSyncAt ?: 0L }.takeIf { it > 0L })
+            "Duration $duration • All: $unified"
+        } else {
+            val parts = channels.joinToString(" • ") { "${it.label}: ${statusText(it.status, it.lastSyncAt)}" }
+            "Duration $duration • $parts"
         }
     }
 

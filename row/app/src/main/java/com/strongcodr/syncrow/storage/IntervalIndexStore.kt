@@ -63,6 +63,17 @@ object IntervalIndexStore {
         }
     }
 
+    fun updateDiagStatus(context: Context, id: Long, newStatus: SyncStatus) {
+        val list = load(context).toMutableList()
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx >= 0) {
+            val old = list[idx]
+            val syncedAt = if (newStatus == SyncStatus.SYNCED) System.currentTimeMillis() else old.lastDiagSyncAt
+            list[idx] = old.copy(diagSyncStatus = newStatus, lastDiagSyncAt = syncedAt)
+            save(context, list)
+        }
+    }
+
     fun delete(context: Context, id: Long) {
         val list = load(context).toMutableList()
         val idx = list.indexOfFirst { it.id == id }

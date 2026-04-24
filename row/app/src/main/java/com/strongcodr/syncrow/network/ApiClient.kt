@@ -4,6 +4,7 @@ import com.strongcodr.syncrow.BuildConfig
 import com.strongcodr.syncrow.model.IntervalUpload
 import com.strongcodr.syncrow.model.LocationSample
 import com.strongcodr.syncrow.model.LocationUpload
+import com.strongcodr.syncrow.model.SensorDiagnostic
 import com.strongcodr.syncrow.model.SensorSample
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -37,7 +38,10 @@ object ApiClient {
             .replace(",", "\\,")
             .replace("=", "\\=")
 
-    private const val MAX_SAMPLES_PER_BATCH = 2000
+    // InfluxDB write batch size, applied uniformly to IMU samples, location samples,
+    // and diagnostic rows. Chosen to stay well under InfluxDB Cloud's line-protocol
+    // payload limit while keeping connection count low.
+    private const val MAX_ROWS_PER_BATCH = 2000
 
     private fun buildLineProtocol(payload: IntervalUpload, intervalLabel: String): String {
         return buildLineProtocol(payload.samples, payload, intervalLabel)
@@ -98,7 +102,7 @@ object ApiClient {
 
     fun uploadInterval(payload: IntervalUpload, intervalLabel: String): Pair<Boolean, Int> {
         var lastCode = -1
-        payload.samples.chunked(MAX_SAMPLES_PER_BATCH).forEach { chunk ->
+        payload.samples.chunked(MAX_ROWS_PER_BATCH).forEach { chunk ->
             if (chunk.isEmpty()) return@forEach
             val lineProtocol = buildLineProtocol(chunk, payload, intervalLabel)
             val body = lineProtocol.toRequestBody("text/plain; charset=utf-8".toMediaType())
@@ -119,9 +123,60 @@ object ApiClient {
         return Pair(true, lastCode)
     }
 
+    private fun buildDiagnosticsLineProtocol(
+        rows: List<SensorDiagnostic>,
+        intervalLabel: String
+    ): String {
+        val sb = StringBuilder()
+        rows.forEach { r ->
+            sb.append("imu_diag")
+                .append(",intervalId=").append(escapeTag(intervalLabel))
+            r.sensorId?.let { sb.append(",sensorId=").append(escapeTag(it)) }
+            r.seat?.let { sb.append(",seat=").append(escapeTag(it)) }
+            sb.append(" received=").append(r.received).append('i')
+                .append(",expected=").append(r.expected).append('i')
+                .append(",dropPct=").append(r.dropPct)
+                .append(",maxGapMs=").append(r.maxGapMs).append('i')
+                .append(",jitterMs=").append(r.jitterMs)
+                .append(",malformed=").append(r.malformed).append('i')
+                .append(",connected=").append(if (r.connected) "t" else "f")
+                .append(",configApplied=").append(if (r.configApplied) "t" else "f")
+                .append(",configFailed=").append(if (r.configFailed) "t" else "f")
+                .append(",reconnects=").append(r.reconnectsThisWindow).append('i')
+                .append(",windowDurationMs=").append(r.windowDurationMs).append('i')
+                .append(",intervalNumeric=").append(r.intervalId).append('i')
+            r.rssi?.let { sb.append(",rssi=").append(it).append('i') }
+            r.lastGattStatus?.let { sb.append(",lastGattStatus=").append(it).append('i') }
+            sb.append(' ').append(r.timestampMs).append('\n')
+        }
+        return sb.toString()
+    }
+
+    fun uploadDiagnostics(rows: List<SensorDiagnostic>, intervalLabel: String): Pair<Boolean, Int> {
+        if (rows.isEmpty()) return Pair(true, 200)
+        var lastCode = -1
+        rows.chunked(MAX_ROWS_PER_BATCH).forEach { chunk ->
+            if (chunk.isEmpty()) return@forEach
+            val lineProtocol = buildDiagnosticsLineProtocol(chunk, intervalLabel)
+            val body = lineProtocol.toRequestBody("text/plain; charset=utf-8".toMediaType())
+
+            val request = Request.Builder()
+                .url("$INFLUX_BASE_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=ms")
+                .addHeader("Authorization", "Token $INFLUX_TOKEN")
+                .post(body)
+                .build()
+
+            client.newCall(request).execute().use { resp ->
+                lastCode = resp.code
+                if (!resp.isSuccessful) return Pair(false, resp.code)
+            }
+        }
+        return Pair(true, lastCode)
+    }
+
     fun uploadLocation(payload: LocationUpload, intervalLabel: String): Pair<Boolean, Int> {
         var lastCode = -1
-        payload.samples.chunked(MAX_SAMPLES_PER_BATCH).forEach { chunk ->
+        payload.samples.chunked(MAX_ROWS_PER_BATCH).forEach { chunk ->
             if (chunk.isEmpty()) return@forEach
             val lineProtocol = buildLocationLineProtocol(chunk, payload, intervalLabel)
             val body = lineProtocol.toRequestBody("text/plain; charset=utf-8".toMediaType())

@@ -17,4 +17,8 @@
         android:id="@+id/intervalsFragment"
         android:title="Previous Intervals" />
 
+    <item
+        android:id="@+id/diagnosticsFragment"
+        android:title="Diagnostics" />
+
 </menu>

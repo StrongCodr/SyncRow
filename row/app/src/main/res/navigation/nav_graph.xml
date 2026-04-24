@@ -34,4 +34,10 @@
         android:name="com.strongcodr.syncrow.IntervalsFragment"
         android:label="Previous Intervals"
         tools:layout="@layout/fragment_intervals" />
+
+    <fragment
+        android:id="@+id/diagnosticsFragment"
+        android:name="com.strongcodr.syncrow.DiagnosticsFragment"
+        android:label="Diagnostics"
+        tools:layout="@layout/fragment_diagnostics" />
 </navigation>

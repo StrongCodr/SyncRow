@@ -7,5 +7,7 @@ data class IntervalMeta(
     val syncStatus: SyncStatus,
     val locationSyncStatus: SyncStatus? = null,
     val lastSensorSyncAt: Long? = null,
-    val lastLocationSyncAt: Long? = null
+    val lastLocationSyncAt: Long? = null,
+    val diagSyncStatus: SyncStatus? = null,
+    val lastDiagSyncAt: Long? = null
 )
