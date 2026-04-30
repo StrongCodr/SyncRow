@@ -23,20 +23,31 @@ class SensorsViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun sanitizeLoaded(loaded: List<Sensor>): List<Sensor> {
-        // Clear WIT broadcast names ("WT...") from saved labels.
-        val nameCleaned = loaded.map { s ->
-            val n = s.name?.trim()
-            if (n != null && n.startsWith("WT", ignoreCase = true)) s.copy(name = null) else s
-        }
-        // Enforce the single-cox invariant on load — if the JSON file got hand-edited or
-        // a prior race produced multiple cox entries, keep the first and demote the rest.
-        // Without this, remapSensorsForModeSwitch would silently drop the extras.
-        var seenCox = false
-        return nameCleaned.map { s ->
-            if (s.role == SensorRole.COX) {
-                if (seenCox) s.copy(role = SensorRole.SEAT) else { seenCox = true; s }
-            } else s
+    companion object {
+        /**
+         * Apply two fixups to a freshly-loaded sensor list:
+         * - clear WitMotion broadcast names (e.g. "WT901..") so they don't stick as user
+         *   labels
+         * - enforce the single-cox invariant, demoting any second-or-later COX-role sensor
+         *   to SEAT. Prevents silent data loss in downstream cox-aware code paths
+         *   (remapSensorsForModeSwitch, buildSensorLabels) if the on-disk JSON was ever
+         *   corrupted or hand-edited with multiple cox entries.
+         *
+         * Pure function — no ViewModel state touched. Exposed internal for unit tests.
+         */
+        internal fun sanitizeLoaded(loaded: List<Sensor>): List<Sensor> {
+            val nameCleaned = loaded.map { s ->
+                val n = s.name?.trim()
+                if (n != null && n.startsWith("WT", ignoreCase = true)) s.copy(name = null) else s
+            }
+            var seenCox = false
+            return nameCleaned.map { s ->
+                if (s.role == SensorRole.COX) {
+                    if (seenCox) s.copy(role = SensorRole.SEAT) else {
+                        seenCox = true; s
+                    }
+                } else s
+            }
         }
     }
 
@@ -133,5 +144,7 @@ class SensorsViewModel(application: Application) : AndroidViewModel(application)
         SensorsStore.save(getApplication(), updated)
     }
 
+    /** Returns the current cox sensor, or null if none is marked. Convenience for callers
+     *  that only need the cox without scanning the full list. */
     fun coxSensor(): Sensor? = _sensors.value?.firstOrNull { it.role == SensorRole.COX }
 }

@@ -147,6 +147,8 @@ object ApiClient {
                 .append(",intervalNumeric=").append(r.intervalId).append('i')
             r.rssi?.let { sb.append(",rssi=").append(it).append('i') }
             r.lastGattStatus?.let { sb.append(",lastGattStatus=").append(it).append('i') }
+            r.connectionIntervalMs?.let { sb.append(",connIntervalMs=").append(it) }
+            if (r.timeReceived > 0) sb.append(",timeReceived=").append(r.timeReceived).append('i')
             sb.append(' ').append(r.timestampMs).append('\n')
         }
         return sb.toString()

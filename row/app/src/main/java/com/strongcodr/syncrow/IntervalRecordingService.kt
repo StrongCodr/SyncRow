@@ -54,6 +54,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.ArrayDeque
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -76,6 +77,7 @@ class IntervalRecordingService : Service() {
         private const val EXTRA_SENSOR_IDS = "extra_sensor_ids"
         private const val EXTRA_SENSOR_SEATS = "extra_sensor_seats"
         private const val EXTRA_SENSOR_DISPLAY_NAMES = "extra_sensor_display_names"
+        private const val EXTRA_SENSOR_ROLES = "extra_sensor_roles"
         private const val EXTRA_FORCE_RECONNECT = "extra_force_reconnect"
 
         private const val ONGOING_NOTIF_ID = 42
@@ -84,6 +86,22 @@ class IntervalRecordingService : Service() {
         private const val KEY_INTERVAL_RUNNING = "interval_running"
         private const val KEY_INTERVAL_ID = "interval_id"
         private const val KEY_SERVICE_ACTIVE = "service_active"
+        private const val KEY_TIME_PACKET_ENABLED = "debug_time_packet_enabled"
+
+        /** Persisted state for the debug TIME-packet toggle. Read at app start to seed
+         *  [BleDeviceClient.enableTimePacket]; written by the diag screen on toggle. */
+        fun isTimePacketEnabled(context: Context): Boolean {
+            return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_TIME_PACKET_ENABLED, false)
+        }
+
+        fun setTimePacketEnabled(context: Context, enabled: Boolean) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_TIME_PACKET_ENABLED, enabled)
+                .apply()
+            BleDeviceClient.enableTimePacket = enabled
+        }
         private const val KEY_LAST_FOREGROUND_ELAPSED = "diag_last_foreground_elapsed"
         private const val KEY_LAST_BACKGROUND_ELAPSED = "diag_last_background_elapsed"
         private const val KEY_PENDING_SOFT_RESET = "diag_pending_soft_reset"
@@ -112,54 +130,13 @@ class IntervalRecordingService : Service() {
             return prefs.getBoolean(KEY_SERVICE_ACTIVE, false)
         }
 
-        private data class SensorLabels(
-            val ids: List<String>,
-            val seats: List<String>,
-            val displayNames: List<String>
-        )
-
-        const val COX_LABEL = "Cox"
+        // SensorLabels and the pure labeling logic live in SensorLabelBuilder.kt so unit
+        // tests can exercise them without instantiating the service. Keep this thin
+        // wrapper because the recording-mode pref still needs to be read against a Context.
+        const val COX_LABEL = COX_LABEL_VALUE
 
         private fun buildSensorLabels(context: Context, sensors: List<Sensor>): SensorLabels {
-            if (sensors.isEmpty()) return SensorLabels(emptyList(), emptyList(), emptyList())
-
-            val mode = RowingModeStore.getRecordingMode(context)
-            val rowerCount = sensors.count { it.role == SensorRole.SEAT }
-            val scullingSeatCount = (rowerCount + 1) / 2
-
-            val ids = ArrayList<String>(sensors.size)
-            val seats = ArrayList<String>(sensors.size)
-            val displayNames = ArrayList<String>(sensors.size)
-
-            var rowerIdx = 0
-            sensors.forEach { sensor ->
-                if (sensor.role == SensorRole.COX) {
-                    val custom = sensor.name?.trim()?.takeIf { it.isNotEmpty() }
-                    ids.add(COX_LABEL)
-                    seats.add(COX_LABEL)
-                    displayNames.add(custom ?: COX_LABEL)
-                } else {
-                    if (mode == RowingMode.SWEEP) {
-                        val seatNumber = rowerCount - rowerIdx
-                        ids.add("Seat $seatNumber")
-                        seats.add("Seat $seatNumber")
-                        displayNames.add(
-                            sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Seat $seatNumber"
-                        )
-                    } else {
-                        val seatNumber = scullingSeatCount - (rowerIdx / 2)
-                        val side = if (rowerIdx % 2 == 0) "Port" else "Starboard"
-                        ids.add("Seat $seatNumber $side")
-                        seats.add("Seat $seatNumber")
-                        displayNames.add(
-                            sensor.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Seat $seatNumber $side"
-                        )
-                    }
-                    rowerIdx++
-                }
-            }
-
-            return SensorLabels(ids, seats, displayNames)
+            return buildSensorLabels(sensors, RowingModeStore.getRecordingMode(context))
         }
 
         fun start(context: Context, sensors: List<Sensor>) {
@@ -170,6 +147,7 @@ class IntervalRecordingService : Service() {
                 putStringArrayListExtra(EXTRA_SENSOR_IDS, ArrayList(labels.ids))
                 putStringArrayListExtra(EXTRA_SENSOR_SEATS, ArrayList(labels.seats))
                 putStringArrayListExtra(EXTRA_SENSOR_DISPLAY_NAMES, ArrayList(labels.displayNames))
+                putStringArrayListExtra(EXTRA_SENSOR_ROLES, ArrayList(labels.roles))
             }
             if (hasConnectedDevicePermission(context)) {
                 context.startForegroundService(i)
@@ -192,6 +170,7 @@ class IntervalRecordingService : Service() {
                 putStringArrayListExtra(EXTRA_SENSOR_IDS, ArrayList(labels.ids))
                 putStringArrayListExtra(EXTRA_SENSOR_SEATS, ArrayList(labels.seats))
                 putStringArrayListExtra(EXTRA_SENSOR_DISPLAY_NAMES, ArrayList(labels.displayNames))
+                putStringArrayListExtra(EXTRA_SENSOR_ROLES, ArrayList(labels.roles))
             }
             // CONNECT_ONLY is used for live UI connection status while the app is in the foreground.
             // Always start as a normal service to avoid ForegroundServiceDidNotStartInTime crashes.
@@ -206,6 +185,7 @@ class IntervalRecordingService : Service() {
                 putStringArrayListExtra(EXTRA_SENSOR_IDS, ArrayList(labels.ids))
                 putStringArrayListExtra(EXTRA_SENSOR_SEATS, ArrayList(labels.seats))
                 putStringArrayListExtra(EXTRA_SENSOR_DISPLAY_NAMES, ArrayList(labels.displayNames))
+                putStringArrayListExtra(EXTRA_SENSOR_ROLES, ArrayList(labels.roles))
                 putExtra(EXTRA_FORCE_RECONNECT, true)
             }
             context.startService(i)
@@ -244,18 +224,23 @@ class IntervalRecordingService : Service() {
     private enum class StopReason { USER_STOP, RECENTS_REMOVED }
     private enum class StrokeState { FORWARD, BACKWARD, UNKNOWN }
 
+    // Mix of threads touches this: BLE binder callbacks (connected/lastSeen/*), coroutine
+    // scopes (everything else). @field:Volatile on the fields read cross-thread without
+    // snapshotting; everything else is either snapshot-read via .toList() or touched from
+    // a single thread in practice.
     private data class ActiveSensor(
         val mac: String,
         var id: String,
         var seat: String?,
         var seatIndex: Int,
         var displayName: String,
+        var role: SensorRole = SensorRole.SEAT,
         val client: BleDeviceClient,
         val samples: MutableList<SensorSample> = mutableListOf(),
         val strokeTimesMs: ArrayDeque<Long> = ArrayDeque(64),
         var intervalId: Long = -1L,
         var lastStoredSampleMs: Long = 0L,
-        var lastSeenSampleMs: Long = 0L,
+        @field:Volatile var lastSeenSampleMs: Long = 0L,
         var latestSampleMs: Long = 0L,
         var latestSample: Normalized? = null,
         var strokeCount: Int = 0,
@@ -263,7 +248,7 @@ class IntervalRecordingService : Service() {
         var maxSpm: Int = 0,
         var detectorState: StrokeState = StrokeState.UNKNOWN,
         var stateStartMs: Long = 0L,
-        var connected: Boolean = false,
+        @field:Volatile var connected: Boolean = false,
         var reconnectJobActive: Boolean = false,
         var reconnectJob: Job? = null,
         var lastDisconnectNotifMs: Long = 0L,
@@ -281,7 +266,10 @@ class IntervalRecordingService : Service() {
     @Volatile private var serviceActive = false
     private var serviceInForeground = false
 
-    private val activeSensors = mutableMapOf<String, ActiveSensor>() // key: mac
+    // ConcurrentHashMap — mutated from multiple coroutines (interval start/stop, idle
+    // connect, connect-retry loops) and read from the diagnostics tick + health monitor.
+    // Snapshot readers still use .toList() for point-in-time consistency over compound reads.
+    private val activeSensors = ConcurrentHashMap<String, ActiveSensor>() // key: mac
     private val strokeAnalyzer = StrokeAnalyzer()
     @Volatile private var sessionIntervalId: Long = -1L
     private var healthMonitorActive = false
@@ -305,6 +293,19 @@ class IntervalRecordingService : Service() {
     private var lastNotifStatus = "IDLE"
     private val locationSamples: MutableList<LocationSample> = mutableListOf()
     private var latestLocation: LocationSample? = null
+    private val locationDedupeWindowMs = 1000L
+
+    private fun addLocationSampleDeduped(sample: LocationSample) {
+        val last = locationSamples.lastOrNull()
+        if (last != null &&
+            last.latitude == sample.latitude &&
+            last.longitude == sample.longitude &&
+            sample.timestampMs - last.timestampMs < locationDedupeWindowMs
+        ) {
+            return
+        }
+        locationSamples.add(sample)
+    }
     private var locationListener: LocationListener? = null
     private var locationManager: LocationManager? = null
     private val connectAttemptMutex = Mutex()
@@ -312,6 +313,10 @@ class IntervalRecordingService : Service() {
     override fun onCreate() {
         super.onCreate()
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // Seed the process-wide debug flag from persisted prefs so toggling the TIME packet
+        // setting survives app/process restart. Same SharedPreferences key the diag screen
+        // writes when the user taps the toggle.
+        BleDeviceClient.enableTimePacket = prefs.getBoolean(KEY_TIME_PACKET_ENABLED, false)
         Notifications.ensureChannels(this)
         if (DEBUG_BLE) {
             Log.d("SYNCROW", "Service onCreate: processStartElapsedMs=$processStartElapsedMs")
@@ -343,7 +348,7 @@ class IntervalRecordingService : Service() {
                 // within ~5s or the app crashes with ForegroundServiceDidNotStartInTime.
                 // startInterval promotes via ensureForeground; bailing out there would miss
                 // the deadline. Stop the service cleanly here instead.
-                if (sensors.none { it.seat != COX_LABEL }) {
+                if (sensors.none { it.role == SensorRole.SEAT }) {
                     postEventNotification(
                         "Cannot start interval",
                         "Add at least one rower sensor to start recording."
@@ -433,7 +438,8 @@ class IntervalRecordingService : Service() {
         val id: String,
         val seat: String?,
         val seatIndex: Int,
-        val displayName: String
+        val displayName: String,
+        val role: SensorRole
     )
 
     private fun readSensorsFromIntent(intent: Intent): List<IntentSensor> {
@@ -441,33 +447,44 @@ class IntervalRecordingService : Service() {
         val ids = intent.getStringArrayListExtra(EXTRA_SENSOR_IDS)
         val seats = intent.getStringArrayListExtra(EXTRA_SENSOR_SEATS)
         val displayNames = intent.getStringArrayListExtra(EXTRA_SENSOR_DISPLAY_NAMES)
+        val roles = intent.getStringArrayListExtra(EXTRA_SENSOR_ROLES)
         if (macs != null && ids != null) {
+            // Prefer the explicit role extra (decouples cox detection from label equality).
+            // Fall back to seat=="Cox" only for legacy intents from older callers — every
+            // in-tree caller now sets the roles extra.
+            val rolesResolved: List<SensorRole> = macs.indices.map { idx ->
+                val raw = roles?.getOrNull(idx)
+                val byRole = raw?.let { name -> runCatching { SensorRole.valueOf(name) }.getOrNull() }
+                if (byRole != null) return@map byRole
+                val fallbackSeat = seats?.getOrNull(idx) ?: ids.getOrNull(idx) ?: macs[idx]
+                if (fallbackSeat == COX_LABEL) SensorRole.COX else SensorRole.SEAT
+            }
             // Cox sensors get seatIndex = 0; rowers are numbered 1..N from the list end so
             // the last rower in the list is "seat 1" (stroke reference for StrokeAnalyzer).
-            val rowerCount = macs.indices.count { idx ->
-                (seats?.getOrNull(idx) ?: ids.getOrNull(idx) ?: macs[idx]) != COX_LABEL
-            }
+            val rowerCount = rolesResolved.count { it == SensorRole.SEAT }
             var rowerIdx = 0
             return macs.mapIndexedNotNull { idx, mac ->
                 val sid = ids.getOrNull(idx) ?: mac
                 val seat = seats?.getOrNull(idx) ?: sid
                 val displayName = displayNames?.getOrNull(idx) ?: seat
-                val seatIndex = if (seat == COX_LABEL) {
+                val role = rolesResolved[idx]
+                val seatIndex = if (role == SensorRole.COX) {
                     0
                 } else {
                     val n = rowerCount - rowerIdx
                     rowerIdx++
                     n
                 }
-                IntentSensor(mac, sid, seat, seatIndex, displayName)
+                IntentSensor(mac, sid, seat, seatIndex, displayName, role)
             }
         }
 
         val mac = intent.getStringExtra(EXTRA_SENSOR_MAC) ?: return emptyList()
         val sid = intent.getStringExtra(EXTRA_SENSOR_ID) ?: mac
         val st = intent.getStringExtra(EXTRA_SEAT) ?: sid
-        val seatIndex = if (st == COX_LABEL) 0 else 1
-        return listOf(IntentSensor(mac, sid, st, seatIndex, st))
+        val role = if (st == COX_LABEL) SensorRole.COX else SensorRole.SEAT
+        val seatIndex = if (role == SensorRole.COX) 0 else 1
+        return listOf(IntentSensor(mac, sid, st, seatIndex, st, role))
     }
 
     private fun startInterval(sensors: List<IntentSensor>) {
@@ -514,6 +531,7 @@ class IntervalRecordingService : Service() {
                     seat = s.seat,
                     seatIndex = s.seatIndex,
                     displayName = s.displayName,
+                    role = s.role,
                     client = client,
                     intervalId = sessionIntervalId,
                     stateStartMs = System.currentTimeMillis()
@@ -525,6 +543,7 @@ class IntervalRecordingService : Service() {
                 existing.seat = s.seat
                 existing.seatIndex = s.seatIndex
                 existing.displayName = s.displayName
+                existing.role = s.role
                 existing.intervalId = sessionIntervalId
                 existing.samples.clear()
                 existing.strokeTimesMs.clear()
@@ -542,7 +561,7 @@ class IntervalRecordingService : Service() {
 
             // Cox doesn't row — exclude from stroke detection. Its samples still flow to
             // disk and InfluxDB as regular IMU data, just not through StrokeAnalyzer.
-            if (s.seat != COX_LABEL) {
+            if (s.role == SensorRole.SEAT) {
                 strokeAnalyzer.addSensor(s.mac, s.seatIndex)
             }
 
@@ -592,6 +611,7 @@ class IntervalRecordingService : Service() {
                     seat = s.seat,
                     seatIndex = s.seatIndex,
                     displayName = s.displayName,
+                    role = s.role,
                     client = client
                 )
                 activeSensors[s.mac] = active
@@ -601,6 +621,7 @@ class IntervalRecordingService : Service() {
                 existing.seat = s.seat
                 existing.seatIndex = s.seatIndex
                 existing.displayName = s.displayName
+                existing.role = s.role
                 connectSensor(existing)
             }
             prefs.edit()
@@ -1109,9 +1130,7 @@ class IntervalRecordingService : Service() {
                 val nowWall = System.currentTimeMillis()
                 val locationSnapshot = latestLocation
                 if (locationSnapshot != null) {
-                    locationSamples.add(
-                        locationSnapshot.copy(timestampMs = nowWall)
-                    )
+                    addLocationSampleDeduped(locationSnapshot.copy(timestampMs = nowWall))
                 }
                 activeSensors.values.toList().forEach { sensor ->
                     val latest = sensor.latestSample ?: return@forEach
@@ -1333,7 +1352,9 @@ class IntervalRecordingService : Service() {
             configApplied = snap.configApplied,
             configFailed = snap.configFailed,
             reconnectsThisWindow = reconnects,
-            lastGattStatus = snap.lastGattStatus
+            lastGattStatus = snap.lastGattStatus,
+            connectionIntervalMs = snap.connectionIntervalMs,
+            timeReceived = snap.timeReceived
         )
     }
 
@@ -1350,14 +1371,14 @@ class IntervalRecordingService : Service() {
         val lastKnown = pickBestLastKnownLocation(mgr)
         latestLocation = lastKnown?.toSample()
         if (lastKnown != null && intervalRunning) {
-            locationSamples.add(latestLocation!!)
+            addLocationSampleDeduped(latestLocation!!)
         }
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
                 val sample = location.toSample()
                 latestLocation = sample
                 if (intervalRunning) {
-                    locationSamples.add(sample)
+                    addLocationSampleDeduped(sample)
                 }
             }
         }
@@ -1825,7 +1846,7 @@ class IntervalRecordingService : Service() {
         val file = File(dir, "summary_${sessionId}.json")
 
         val seats = activeSensors.values
-            .filter { it.seat != COX_LABEL } // Cox has no strokes; excluded from the per-seat recap.
+            .filter { it.role == SensorRole.SEAT } // Cox has no strokes; excluded from the per-seat recap.
             .sortedByDescending { it.seatIndex } // Seat 1 is bottom (smallest index)
             .map { sensor ->
                 val avgSpm = if (durationMs > 0) {

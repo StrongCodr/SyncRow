@@ -27,7 +27,16 @@ data class BleDiagnosticSnapshot(
     val rssi: Int?,
     val lastGattStatus: Int?,
     val configApplied: Boolean,
-    val configFailed: Boolean
+    val configFailed: Boolean,
+    /** Negotiated link-layer connection interval in milliseconds. Null until the
+     *  framework fires [BluetoothGattCallback.onConnectionUpdated] (API 26+). This is
+     *  the only programmatic source of truth for whether requestConnectionPriority(HIGH)
+     *  was honored — the request itself only returns "queued," not "granted." */
+    val connectionIntervalMs: Double?,
+    /** Count of 0x55 0x50 TIME packets received this window. Zero when the time-packet
+     *  toggle is off (RSW bit 0 not set). Used to verify whether enabling TIME
+     *  significantly cuts effective 0x61 throughput on a saturated link. */
+    val timeReceived: Int
 )
 
 class BleDeviceClient(private val context: Context) {
@@ -56,6 +65,8 @@ class BleDeviceClient(private val context: Context) {
     private var lastSampleElapsedMs: Long = 0L
     private var lastRssi: Int? = null
     private var lastGattStatus: Int? = null
+    private var lastConnectionIntervalUnits: Int? = null   // 1.25 ms units; null until LL_CONNECTION_UPDATE_IND fires
+    private var timeReceived: Int = 0                      // count of 0x55 0x50 packets seen this window
 
     // Config-write sequence tracking. configFailed flips true on any non-success write;
     // configApplied is true only once all three frames (unlock/rate/save) have succeeded.
@@ -79,6 +90,17 @@ class BleDeviceClient(private val context: Context) {
             0xFF.toByte(), 0xAA.toByte(), 0x03.toByte(), rrate.toByte(), 0x00.toByte()
         )
 
+        // RSW (Output Selection) register bitmask. On the BLE 5.0 firmware family, the
+        // 0x61 combined packet streams automatically regardless of RSW. Bit 0 controls the
+        // separate TIME (0x50) stream; we use this to enable/disable just that.
+        private fun cmdSetRsw(value: Int) = byteArrayOf(
+            0xFF.toByte(), 0xAA.toByte(), 0x02.toByte(),
+            (value and 0xFF).toByte(),
+            ((value shr 8) and 0xFF).toByte()
+        )
+        private const val RSW_TIME_BIT = 0x0001
+        private const val RSW_OFF      = 0x0000
+
         // RRATE register values (0x03). See wit_sensor_protocol memory.
         const val RRATE_10HZ  = 0x06
         const val RRATE_20HZ  = 0x07
@@ -87,7 +109,19 @@ class BleDeviceClient(private val context: Context) {
         const val RRATE_200HZ = 0x0B
 
         // App-wide target ODR. Mutable so the recording path can raise/lower without rebuilding.
-        @Volatile var targetRateRegister: Int = RRATE_100HZ
+        // Default is 50 Hz: the honest per-sensor ceiling for an 8+1 (nine sensor) setup
+        // on Android BLE scheduling. Raising to 100 Hz on 9 sensors saturates the radio and
+        // produces high jitter + big gaps (see diagnostics). 50 Hz is plenty for stroke
+        // timing: Nyquist covers rowing harmonics and sub-sample interpolation keeps catch
+        // precision in the 5–10 ms range. Bump to RRATE_100HZ for bench or 1–2 sensor tests.
+        @Volatile var targetRateRegister: Int = RRATE_50HZ
+
+        // Debug toggle: when true, the config chain on connect ALSO writes RSW=0x0001 so
+        // the sensor emits 0x55 0x50 TIME packets alongside the default 0x55 0x61. Used to
+        // measure whether enabling a parallel notification stream halves effective 0x61
+        // throughput on a constrained BLE link. Read at config-write time only — toggling
+        // mid-connection has no effect; user must reconnect for the change to land.
+        @Volatile var enableTimePacket: Boolean = false
 
         fun expectedHzFor(rrate: Int): Int = when (rrate) {
             RRATE_10HZ  -> 10
@@ -309,7 +343,7 @@ class BleDeviceClient(private val context: Context) {
                     return
                 }
                 if (DEBUG_BLE) Log.d(tag, "CCCD enabled mac=$macLog — queueing config writes")
-                // Notifications are live. Push config: unlock → set ODR → save.
+                // Notifications are live. Push config: unlock → set ODR → set RSW → save.
                 // Skip (and mark config un-applied) if we don't have the canonical write
                 // characteristic — sensor continues streaming at whatever rate its flash holds.
                 val wc = writeCharacteristic
@@ -318,10 +352,12 @@ class BleDeviceClient(private val context: Context) {
                     if (DEBUG_BLE) Log.w(tag, "No WIT write UUID on $macLog — skipping ODR config")
                     return
                 }
-                beginConfigSequence()
-                pendingWrites.addLast(CMD_UNLOCK)
-                pendingWrites.addLast(cmdSetRate(targetRateRegister))
-                pendingWrites.addLast(CMD_SAVE)
+                val rswValue = if (enableTimePacket) RSW_TIME_BIT else RSW_OFF
+                // Always write RSW too: leaves the sensor in a known state regardless of
+                // whatever bitmask happened to be saved in its flash from prior sessions.
+                val frames = listOf(CMD_UNLOCK, cmdSetRate(targetRateRegister), cmdSetRsw(rswValue), CMD_SAVE)
+                beginConfigSequence(frames.size)
+                frames.forEach { pendingWrites.addLast(it) }
                 processNextWrite(gatt)
             }
 
@@ -331,6 +367,9 @@ class BleDeviceClient(private val context: Context) {
                 status: Int
             ) {
                 super.onCharacteristicWrite(gatt, characteristic, status)
+                // Reject callbacks from a torn-down gatt so an old config-write success
+                // can't prematurely decrement the new connection's configPendingCount.
+                if (gatt !== this@BleDeviceClient.gatt) return
                 if (characteristic.uuid != writeCharacteristic?.uuid) return
                 writeInFlight = false
                 if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -354,13 +393,20 @@ class BleDeviceClient(private val context: Context) {
 
                 val bytes = characteristic.value ?: return
 
-                // Expect WIT 20-byte packet: 0x55 0x61 ...
-                if (bytes.size < 20 || bytes[0] != 0x55.toByte()) {
+                // Expect WIT packet: 0x55 <flag> ...
+                if (bytes.size < 4 || bytes[0] != 0x55.toByte()) {
                     bumpMalformed()
                     return
                 }
                 val flag = bytes[1].toUByte().toInt()
-                if (flag != 0x61) {
+                if (flag == 0x50) {
+                    // TIME packet (debug toggle). 10 bytes total. We don't decode the
+                    // timestamp here — just count arrivals so the diag screen can show
+                    // whether enabling it cuts effective 0x61 throughput on a busy link.
+                    bumpTimeReceived()
+                    return
+                }
+                if (flag != 0x61 || bytes.size < 20) {
                     bumpMalformed()
                     return
                 }
@@ -407,6 +453,27 @@ class BleDeviceClient(private val context: Context) {
                 super.onReadRemoteRssi(gatt, rssi, status)
                 if (status == BluetoothGatt.GATT_SUCCESS) recordRssi(rssi)
             }
+
+            // Fires whenever the link layer changes the connection interval / latency /
+            // supervision timeout. The only programmatic confirmation of what Android
+            // actually granted in response to requestConnectionPriority().
+            override fun onConnectionUpdated(
+                gatt: BluetoothGatt,
+                interval: Int,
+                latency: Int,
+                timeout: Int,
+                status: Int
+            ) {
+                super.onConnectionUpdated(gatt, interval, latency, timeout, status)
+                if (status == BluetoothGatt.GATT_SUCCESS) recordConnectionInterval(interval)
+                if (DEBUG_BLE) {
+                    Log.d(
+                        tag,
+                        "LL conn updated mac=$macLog interval=${interval}u (${interval * 1.25}ms) " +
+                            "latency=$latency timeoutu=$timeout status=$status"
+                    )
+                }
+            }
         })
     }
 
@@ -449,6 +516,11 @@ class BleDeviceClient(private val context: Context) {
     }
 
     @Synchronized
+    private fun bumpTimeReceived() {
+        timeReceived++
+    }
+
+    @Synchronized
     private fun recordGattStatus(status: Int) {
         lastGattStatus = status
     }
@@ -459,8 +531,13 @@ class BleDeviceClient(private val context: Context) {
     }
 
     @Synchronized
-    private fun beginConfigSequence() {
-        configPendingCount = 3
+    private fun recordConnectionInterval(intervalUnits: Int) {
+        lastConnectionIntervalUnits = intervalUnits
+    }
+
+    @Synchronized
+    private fun beginConfigSequence(count: Int) {
+        configPendingCount = count
         configFailed = false
         configApplied = false
     }
@@ -487,11 +564,13 @@ class BleDeviceClient(private val context: Context) {
         intervalN = 0
         intervalSum = 0.0
         intervalSumSq = 0.0
+        timeReceived = 0
         // Reset across connections — otherwise the first gap after a reconnect spans the
         // entire disconnect duration and poisons maxGapMs for that window.
         lastSampleElapsedMs = 0L
         lastRssi = null
         lastGattStatus = null
+        lastConnectionIntervalUnits = null
         configPendingCount = 0
         configFailed = false
         configApplied = false
@@ -517,7 +596,9 @@ class BleDeviceClient(private val context: Context) {
             rssi = lastRssi,
             lastGattStatus = lastGattStatus,
             configApplied = configApplied,
-            configFailed = configFailed
+            configFailed = configFailed,
+            connectionIntervalMs = lastConnectionIntervalUnits?.let { it * 1.25 },
+            timeReceived = timeReceived
         )
         received = 0
         malformed = 0
@@ -525,6 +606,7 @@ class BleDeviceClient(private val context: Context) {
         intervalN = 0
         intervalSum = 0.0
         intervalSumSq = 0.0
+        timeReceived = 0
         return snap
     }
 

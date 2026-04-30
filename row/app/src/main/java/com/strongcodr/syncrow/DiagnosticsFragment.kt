@@ -4,8 +4,10 @@ import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import com.strongcodr.syncrow.model.SensorDiagnostic
@@ -32,13 +34,32 @@ class DiagnosticsFragment : Fragment(R.layout.fragment_diagnostics) {
     private val holders = mutableMapOf<String, RowHolder>()
     private var container: LinearLayout? = null
     private var status: TextView? = null
+    private var timeToggleButton: Button? = null
     private var tickJob: Job? = null
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         container = view.findViewById(R.id.diag_container)
         status = view.findViewById(R.id.diag_status)
+
+        val ctx = requireContext()
+        val btn: Button = view.findViewById(R.id.diag_time_toggle)
+        btn.text = timeToggleLabel(IntervalRecordingService.isTimePacketEnabled(ctx))
+        btn.setOnClickListener {
+            val now = !IntervalRecordingService.isTimePacketEnabled(ctx)
+            IntervalRecordingService.setTimePacketEnabled(ctx, now)
+            btn.text = timeToggleLabel(now)
+            Toast.makeText(
+                ctx,
+                "TIME packet ${if (now) "ON" else "OFF"} — reconnect sensors to apply.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        timeToggleButton = btn
     }
+
+    private fun timeToggleLabel(enabled: Boolean): String =
+        if (enabled) "DEBUG: TIME packet ON" else "DEBUG: TIME packet OFF"
 
     override fun onResume() {
         super.onResume()
@@ -65,6 +86,7 @@ class DiagnosticsFragment : Fragment(R.layout.fragment_diagnostics) {
         holders.clear()
         container = null
         status = null
+        timeToggleButton = null
     }
 
     private fun render(rows: List<SensorDiagnostic>) {
@@ -166,12 +188,16 @@ class DiagnosticsFragment : Fragment(R.layout.fragment_diagnostics) {
 
         val rssiStr = row.rssi?.let { "$it dBm" } ?: "—"
         val gattStr = row.lastGattStatus?.let { "status $it" } ?: "status OK"
+        val intervalStr = row.connectionIntervalMs?.let { "%.1f ms".format(it) } ?: "—"
         holder.line2.text = buildString {
             append("rssi ").append(rssiStr)
             append("  •  malformed ").append(row.malformed)
             append("  •  reconnects ").append(row.reconnectsThisWindow)
             append("  •  ").append(gattStr)
+            append("  •  conn ").append(intervalStr)
             append("  •  window ").append(row.windowDurationMs).append("ms")
+            // TIME packet counter only appears when the debug toggle is on (zero when off).
+            if (row.timeReceived > 0) append("  •  TIME ").append(row.timeReceived).append("/s")
         }
     }
 

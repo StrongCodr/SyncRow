@@ -39,6 +39,16 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <Button
+        android:id="@+id/diag_time_toggle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textSize="12sp"
+        android:text="DEBUG: TIME packet OFF"
+        app:layout_constraintTop_toBottomOf="@id/diag_status"
+        app:layout_constraintStart_toStartOf="parent" />
+
     <ScrollView
         android:id="@+id/diag_scroll"
         android:layout_width="0dp"
@@ -46,7 +56,7 @@
         android:layout_marginTop="8dp"
         android:fillViewport="true"
         android:scrollbars="vertical"
-        app:layout_constraintTop_toBottomOf="@id/diag_status"
+        app:layout_constraintTop_toBottomOf="@id/diag_time_toggle"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintBottom_toBottomOf="parent">
