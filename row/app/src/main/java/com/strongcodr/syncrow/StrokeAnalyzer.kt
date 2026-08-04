@@ -1,5 +1,6 @@
 package com.strongcodr.syncrow
 
+import com.strongcodr.syncrow.model.SensorSyncStatus
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -15,6 +16,13 @@ import kotlin.math.sqrt
  * Once two or more sensors have reported a catch in the same stroke cycle,
  * the analyzer computes Δt (lateness) relative to the reference sensor
  * (seat with the lowest seat index, i.e. the stroke rower).
+ *
+ * PER-SEAT QUALITY GATING (shared spec with the portal, RESEARCH.md §8.5): every
+ * seat is judged on its own acquisition and pairing. A seat that spaces out —
+ * BLE stalls and the sampling loop re-writes the last value (zero-order-hold) —
+ * is flagged [SensorSyncStatus.DEGRADED_SIGNAL] and its stale lateness suppressed,
+ * while every other seat keeps updating. Held samples (`fresh == false`) are never
+ * fed into detection, so a flat plateau can't corrupt the median or invent catches.
  *
  * Thread safety: all public methods are synchronized. The analyzer is called
  * from [IntervalRecordingService]'s IO coroutine (onSample) and the main
@@ -85,6 +93,21 @@ class StrokeAnalyzer {
             get() = if (prevCatchMs > 0 && lastCatchMs > prevCatchMs)
                 lastCatchMs - prevCatchMs else 0L
 
+        // ── Zero-order-hold (degraded acquisition) tracking ──
+        // A tick with no fresh BLE sample repeats the last value (the
+        // IntervalRecordingService polling loop re-writes latestSample). We measure
+        // how long fresh data has been missing; past a fraction of a stroke the
+        // seat is DEGRADED_SIGNAL and its waveform there is unmeasurable.
+        private var lastFreshTimeMs = 0L
+
+        /** ms since the last fresh (non-held) sample; 0 while fresh. */
+        var heldRunMs: Long = 0L
+            private set
+
+        /** True when fresh data has been missing for too much of a stroke. */
+        var degraded: Boolean = false
+            private set
+
         // ── Gyro magnitude for phase determination ──
         // Accumulate over a lookahead window after each crossing, not just
         // the instant value.
@@ -110,9 +133,23 @@ class StrokeAnalyzer {
          * @return the interpolated catch time in ms if a catch was just detected, else null.
          */
         fun onSample(
-            timeMs: Long, pitch: Float, roll: Float, yaw: Float,
+            timeMs: Long, fresh: Boolean, pitch: Float, roll: Float, yaw: Float,
             wx: Float, wy: Float, wz: Float
         ): Long? {
+            // ── Held-sample gate ──
+            // No fresh BLE data this tick: the value is a zero-order-hold repeat.
+            // Track how long we've been held and skip detection entirely, so a flat
+            // plateau neither corrupts the running median nor fabricates a crossing.
+            if (!fresh) {
+                if (lastFreshTimeMs > 0L) heldRunMs = timeMs - lastFreshTimeMs
+                val thresh = max(HELD_FLOOR_MS, (strokePeriodMs * HELD_RUN_FRAC).toLong())
+                degraded = heldRunMs > thresh
+                return null
+            }
+            lastFreshTimeMs = timeMs
+            heldRunMs = 0L
+            degraded = false
+
             val gyroMag = sqrt(wx * wx + wy * wy + wz * wz)
 
             // ── Accumulate gyro lookahead from previous crossing ──
@@ -267,6 +304,9 @@ class StrokeAnalyzer {
             gyroLookaheadRemaining = 0
             catchIsUpCrossing = null
             recentGyroUp = 0.0; recentGyroDown = 0.0
+            lastFreshTimeMs = 0L
+            heldRunMs = 0L
+            degraded = false
         }
 
         // ── Welford's online variance ──
@@ -351,6 +391,10 @@ class StrokeAnalyzer {
             private const val RECALIB_RATIO = 2.0  // other channel must be 2× current
             private const val RECALIB_SAMPLES = 50 // must dominate for 50 consecutive samples (~5s)
             private const val GYRO_LOOKAHEAD_SAMPLES = 3  // ~300ms at 10 Hz
+
+            // Degraded-acquisition gate (mirrors portal max_held_run_frac = 0.30).
+            private const val HELD_RUN_FRAC = 0.30 // held > this fraction of a stroke → degraded
+            private const val HELD_FLOOR_MS = 500L // ...but at least this, before a period is known
         }
     }
 
@@ -360,6 +404,12 @@ class StrokeAnalyzer {
 
     /** Latest per-sensor lateness relative to the reference (stroke) sensor, in ms. */
     private val _lateness = mutableMapOf<String, Long>()
+
+    /** When each sensor's lateness was last (re)computed, for staleness. */
+    private val _latenessUpdatedMs = mutableMapOf<String, Long>()
+
+    /** Most recent sample time seen across all sensors (the "now" for staleness). */
+    private var lastSampleTimeMs = 0L
 
     /** Reference sensor MAC (lowest seat index). */
     private var referenceMac: String? = null
@@ -384,12 +434,13 @@ class StrokeAnalyzer {
      */
     @Synchronized
     fun onSample(
-        mac: String, timeMs: Long,
+        mac: String, timeMs: Long, fresh: Boolean,
         pitch: Float, roll: Float, yaw: Float,
         wx: Float, wy: Float, wz: Float
     ): Long? {
+        if (timeMs > lastSampleTimeMs) lastSampleTimeMs = timeMs
         val cal = calibrators[mac] ?: return null
-        val catchTimeMs = cal.onSample(timeMs, pitch, roll, yaw, wx, wy, wz) ?: return null
+        val catchTimeMs = cal.onSample(timeMs, fresh, pitch, roll, yaw, wx, wy, wz) ?: return null
 
         val refMac = referenceMac ?: return null
         val refCal = calibrators[refMac] ?: return null
@@ -404,16 +455,19 @@ class StrokeAnalyzer {
         }
 
         if (mac == refMac) {
-            // Reference just caught — check other sensors
+            // Reference just caught — check other sensors. A degraded seat is skipped
+            // (its catch is stale), so it never pairs off a held plateau.
             for ((otherMac, otherCal) in calibrators) {
                 if (otherMac == refMac) continue
-                if (otherCal.lastCatchMs == 0L) continue
+                if (otherCal.lastCatchMs == 0L || otherCal.degraded) continue
                 val dt = otherCal.lastCatchMs - catchTimeMs
                 if (abs(dt) < pairWindow) {
                     _lateness[otherMac] = dt
+                    _latenessUpdatedMs[otherMac] = timeMs
                 }
             }
             _lateness[refMac] = 0L
+            _latenessUpdatedMs[refMac] = timeMs
             return 0L
         } else {
             // Non-reference caught — check against reference
@@ -421,6 +475,7 @@ class StrokeAnalyzer {
             val dt = catchTimeMs - refCal.lastCatchMs
             if (abs(dt) < pairWindow) {
                 _lateness[mac] = dt
+                _latenessUpdatedMs[mac] = timeMs
                 return dt
             }
             return null
@@ -430,6 +485,24 @@ class StrokeAnalyzer {
     /** Get the latest lateness in ms for a sensor. Null if not yet computed. */
     @Synchronized
     fun getLateness(mac: String): Long? = _lateness[mac]
+
+    /**
+     * Per-seat real-time quality (shared spec, RESEARCH.md §8.5). One bad seat is
+     * flagged individually — it never affects any other seat's status:
+     *   CALIBRATING     — axis not locked yet
+     *   DEGRADED_SIGNAL — sensor spaced out (held samples); lateness unmeasurable
+     *   STALE           — calibrated but no recent paired catch vs the stroke
+     *   OK              — fresh data + a recent paired catch
+     */
+    @Synchronized
+    fun getStatus(mac: String): SensorSyncStatus {
+        val cal = calibrators[mac] ?: return SensorSyncStatus.CALIBRATING
+        if (cal.selectedChannel == null) return SensorSyncStatus.CALIBRATING
+        if (cal.degraded) return SensorSyncStatus.DEGRADED_SIGNAL
+        val updated = _latenessUpdatedMs[mac] ?: 0L
+        return if (updated > 0L && lastSampleTimeMs - updated <= STALE_WINDOW_MS)
+            SensorSyncStatus.OK else SensorSyncStatus.STALE
+    }
 
     /** Get the selected channel name for a sensor, or null if still calibrating. */
     @Synchronized
@@ -446,6 +519,8 @@ class StrokeAnalyzer {
     fun reset() {
         calibrators.values.forEach { it.reset() }
         _lateness.clear()
+        _latenessUpdatedMs.clear()
+        lastSampleTimeMs = 0L
         referenceMac = null
     }
 
@@ -454,6 +529,8 @@ class StrokeAnalyzer {
     fun clear() {
         calibrators.clear()
         _lateness.clear()
+        _latenessUpdatedMs.clear()
+        lastSampleTimeMs = 0L
         referenceMac = null
     }
 
@@ -471,6 +548,9 @@ class StrokeAnalyzer {
 
         /** Maximum pairing window — even at very low SPM, cap it. */
         private const val PAIR_CEILING_MS = 1200L
+
+        /** No paired catch within this long → seat is STALE (shows "--", not a frozen value). */
+        private const val STALE_WINDOW_MS = 6000L
 
         private fun clampLong(lo: Long, value: Long, hi: Long): Long =
             max(lo, min(value, hi))

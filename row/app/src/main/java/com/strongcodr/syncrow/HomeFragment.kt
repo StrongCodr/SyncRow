@@ -371,12 +371,15 @@ class HomeFragment : Fragment() {
                 if (sensor.role == SensorRole.COX) {
                     ref?.lateness?.text = "Hull reference (no stroke)"
                 } else {
+                    val syncStatus = prefs.getString(syncStatusKey(sensor.mac), null)
                     val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
-                    ref?.lateness?.text = if (latenessMs == Long.MIN_VALUE) {
-                        "Lateness vs Stroke: -- ms"
-                    } else {
-                        val sign = if (latenessMs > 0) "+" else ""
-                        "Lateness vs Stroke: $sign${latenessMs} ms"
+                    ref?.lateness?.text = when {
+                        syncStatus == "DEGRADED_SIGNAL" -> "Lateness vs Stroke: sensor dropout"
+                        latenessMs == Long.MIN_VALUE -> "Lateness vs Stroke: -- ms"
+                        else -> {
+                            val sign = if (latenessMs > 0) "+" else ""
+                            "Lateness vs Stroke: $sign${latenessMs} ms"
+                        }
                     }
                 }
             }
@@ -626,5 +629,6 @@ class HomeFragment : Fragment() {
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
         private fun latenessKey(mac: String) = "live_lateness_$mac"
+        private fun syncStatusKey(mac: String) = "live_syncstatus_$mac"
     }
 }
