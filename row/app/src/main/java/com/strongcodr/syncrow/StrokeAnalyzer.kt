@@ -57,12 +57,8 @@ class StrokeAnalyzer {
 
         // ── Median-crossing state ──
 
-        /** Sliding window of recent *smoothed* signal values for the running median. */
-        private val signalWindow = ArrayDeque<Float>(WINDOW_SIZE + 1)
-
-        /** Running sorted copy for median lookup.  We use integer indices
-         *  into [signalWindow] rather than storing floats directly, to avoid
-         *  the Float equality problem on removal. */
+        /** Running sorted list of window ids (by their smoothed value) for O(log n)
+         *  median lookup. Ids (not floats) so removal has no Float-equality problem. */
         private val sortedIndices = mutableListOf<Int>()
 
         /** Monotonically increasing insert counter — each sample gets a unique id. */
@@ -70,6 +66,12 @@ class StrokeAnalyzer {
 
         /** Map from insert-counter id to the smoothed value, for sorting. */
         private val idToValue = mutableMapOf<Int, Float>()
+
+        /** Map from insert-counter id to sample time — the median window is evicted
+         *  by AGE (WINDOW_MS), not sample count, so it spans a fixed span of time
+         *  regardless of the (variable) fresh-sample rate. */
+        private val idToTime = mutableMapOf<Int, Long>()
+        private val windowIds = ArrayDeque<Int>()
 
         /** Previous smoothed value and time for crossing interpolation. */
         private var prevSmoothed = Float.NaN
@@ -80,6 +82,15 @@ class StrokeAnalyzer {
          *  so noise wiggles near the median can't fire extra (double) crossings. */
         private var stateAbove = false
         private var stateInit = false
+
+        /** Raw (no-hysteresis) median-crossing tracking, kept SEPARATE from the
+         *  Schmitt state so the catch is TIMED at the true median crossing (where two
+         *  consecutive samples straddle the median → interpolation, never extrapolation)
+         *  while the Schmitt flip only decides WHETHER to emit. */
+        private var prevAboveRaw = false
+        private var lastRawCrossMs = 0L
+        private var lastRawCrossUp = false
+        private var haveRawCross = false
 
         /** Small ring buffer for smoothing (3-sample moving average). */
         private val smoothBuf = ArrayDeque<Float>(4)
@@ -123,8 +134,9 @@ class StrokeAnalyzer {
         private var gyroAccumDown = 0.0
         private var gyroSamplesDown = 0
 
-        /** How many samples to accumulate gyro after a crossing (~300ms at 10 Hz). */
-        private var gyroLookaheadRemaining = 0
+        /** Accumulate gyro until this wall-time after a crossing (GYRO_LOOKAHEAD_MS) —
+         *  time-based so it captures the same drive window at any fresh-sample rate. */
+        private var gyroLookaheadUntilMs = 0L
         private var lastCrossingWasUp = false
 
         /** Whether the crossing that corresponds to the catch is upward. */
@@ -159,8 +171,8 @@ class StrokeAnalyzer {
 
             val gyroMag = sqrt(wx * wx + wy * wy + wz * wz)
 
-            // ── Accumulate gyro lookahead from previous crossing ──
-            if (gyroLookaheadRemaining > 0) {
+            // ── Accumulate gyro for GYRO_LOOKAHEAD_MS after the previous crossing ──
+            if (timeMs <= gyroLookaheadUntilMs) {
                 if (lastCrossingWasUp) {
                     gyroAccumUp += gyroMag
                     gyroSamplesUp++
@@ -168,7 +180,6 @@ class StrokeAnalyzer {
                     gyroAccumDown += gyroMag
                     gyroSamplesDown++
                 }
-                gyroLookaheadRemaining--
             }
 
             // ── Phase 1: Channel calibration ──
@@ -199,15 +210,21 @@ class StrokeAnalyzer {
 
             // Update signal window with smoothed value
             val id = insertCounter++
-            signalWindow.addLast(smoothed)
             idToValue[id] = smoothed
+            idToTime[id] = timeMs
+            windowIds.addLast(id)
             insertSortedById(sortedIndices, idToValue, id)
 
-            if (signalWindow.size > WINDOW_SIZE) {
-                val oldestId = id - WINDOW_SIZE
-                signalWindow.removeFirst()
+            // Evict by AGE (fixed time span, rate-independent), with a hard sample cap
+            // so a burst can't grow the window without bound.
+            while (windowIds.isNotEmpty() &&
+                (timeMs - idToTime[windowIds.first()]!! > WINDOW_MS ||
+                    windowIds.size > MAX_WINDOW_SAMPLES)
+            ) {
+                val oldestId = windowIds.removeFirst()
                 removeSortedById(sortedIndices, idToValue, oldestId)
                 idToValue.remove(oldestId)
+                idToTime.remove(oldestId)
             }
 
             if (sortedIndices.size < MIN_WINDOW_FOR_MEDIAN) return null
@@ -224,17 +241,34 @@ class StrokeAnalyzer {
 
             if (prevSmoothed.isNaN() || prevTimeMs == 0L || !stateInit) {
                 stateAbove = smoothed > median
+                prevAboveRaw = smoothed > median
                 stateInit = true
                 prevSmoothed = smoothed
                 prevTimeMs = timeMs
                 return null
             }
 
-            // ── Schmitt-trigger crossing ──
-            // Hysteresis band scales with the stroke swing (IQR of the window), so
-            // the signal must clear the median by ~a quarter-swing before the state
-            // flips. This kills the double-counts a bare median-crossing produces
-            // when a noisy/wobbly signal grazes the median more than once per stroke.
+            // (1) RAW median crossing → the accurate catch TIME. prev and current
+            //     straddle the median here, so frac ∈ [0,1] and we interpolate (a
+            //     +hysteresis flip point would force an extrapolation and bias the
+            //     time ~1 sample late, which does NOT cancel between seats of unequal
+            //     amplitude — exactly the bow-vs-stroke case).
+            val aboveRaw = smoothed > median
+            if (aboveRaw != prevAboveRaw) {
+                val d = smoothed - prevSmoothed
+                if (abs(d) > 1e-6f) {
+                    val frac = ((median - prevSmoothed) / d).coerceIn(0f, 1f)
+                    lastRawCrossMs = prevTimeMs + (frac * (timeMs - prevTimeMs)).toLong()
+                    lastRawCrossUp = aboveRaw
+                    haveRawCross = true
+                }
+            }
+            prevAboveRaw = aboveRaw
+
+            // (2) Schmitt confirmation → decides WHETHER a real swing happened. The
+            //     dead-band (±h, scaled to the stroke swing via IQR) rejects the
+            //     double-counts a bare crossing makes when a noisy signal grazes the
+            //     median more than once per stroke.
             val q1 = idToValue[sortedIndices[n / 4]] ?: median
             val q3 = idToValue[sortedIndices[(3 * n) / 4]] ?: median
             val h = HYST_FRAC * (q3 - q1)
@@ -243,38 +277,26 @@ class StrokeAnalyzer {
                 smoothed < median - h -> false
                 else -> stateAbove          // inside the dead-band → hold state
             }
-            if (newAbove == stateAbove) {
-                prevSmoothed = smoothed
-                prevTimeMs = timeMs
-                return null
-            }
-
-            // ── Confirmed crossing ──
-            val crossingUp = newAbove       // just went below → above
+            val confirmedFlip = newAbove != stateAbove
             stateAbove = newAbove
-
-            val denom = smoothed - prevSmoothed
-            if (abs(denom) < 1e-6f) {
-                prevSmoothed = smoothed
-                prevTimeMs = timeMs
-                return null
-            }
-
-            // Linear interpolation for sub-sample precision (at the median level)
-            val frac = (median - prevSmoothed) / denom
-            val crossingTimeMs = prevTimeMs + (frac * (timeMs - prevTimeMs)).toLong()
-
-            // Start gyro lookahead accumulation for this crossing
-            gyroLookaheadRemaining = GYRO_LOOKAHEAD_SAMPLES
-            lastCrossingWasUp = crossingUp
 
             prevSmoothed = smoothed
             prevTimeMs = timeMs
 
+            // Emit only on a confirmed swing that has a matching raw crossing to time it.
+            if (!confirmedFlip || !haveRawCross || lastRawCrossUp != newAbove) return null
+            val crossingUp = newAbove
+            val crossingTimeMs = lastRawCrossMs   // the TRUE median-crossing time
+            haveRawCross = false
+
+            // Start the (time-based) gyro lookahead for this crossing.
+            gyroLookaheadUntilMs = timeMs + GYRO_LOOKAHEAD_MS
+            lastCrossingWasUp = crossingUp
+
             // Determine which direction is the catch (higher gyro after = drive phase)
             if (catchIsUpCrossing == null
-                && gyroSamplesUp >= GYRO_LOOKAHEAD_SAMPLES * 3
-                && gyroSamplesDown >= GYRO_LOOKAHEAD_SAMPLES * 3
+                && gyroSamplesUp >= MIN_GYRO_SAMPLES
+                && gyroSamplesDown >= MIN_GYRO_SAMPLES
             ) {
                 recentGyroUp = gyroAccumUp / gyroSamplesUp
                 recentGyroDown = gyroAccumDown / gyroSamplesDown
@@ -312,21 +334,26 @@ class StrokeAnalyzer {
             selectedChannel = null
             emaVariancePitch = 0.0; emaVarianceRoll = 0.0; emaVarianceYaw = 0.0
             recalibCounter = 0
-            signalWindow.clear()
             sortedIndices.clear()
             idToValue.clear()
+            idToTime.clear()
+            windowIds.clear()
             insertCounter = 0
             smoothBuf.clear()
             prevSmoothed = Float.NaN
             prevTimeMs = 0L
             stateAbove = false
             stateInit = false
+            prevAboveRaw = false
+            lastRawCrossMs = 0L
+            lastRawCrossUp = false
+            haveRawCross = false
             lastCatchMs = 0L
             prevCatchMs = 0L
             catchCount = 0
             gyroAccumUp = 0.0; gyroSamplesUp = 0
             gyroAccumDown = 0.0; gyroSamplesDown = 0
-            gyroLookaheadRemaining = 0
+            gyroLookaheadUntilMs = 0L
             catchIsUpCrossing = null
             recentGyroUp = 0.0; recentGyroDown = 0.0
             lastFreshTimeMs = 0L
@@ -396,12 +423,14 @@ class StrokeAnalyzer {
                     }
                     recalibCounter = 0
                     // Reset crossing detection state for the new channel
-                    signalWindow.clear()
                     sortedIndices.clear()
                     idToValue.clear()
+                    idToTime.clear()
+                    windowIds.clear()
                     smoothBuf.clear()
                     prevSmoothed = Float.NaN
                     stateInit = false      // re-arm the Schmitt trigger for the new channel
+                    haveRawCross = false
                     // Keep catch times and gyro phase — those are still valid
                 }
             } else {
@@ -410,13 +439,17 @@ class StrokeAnalyzer {
         }
 
         companion object {
-            private const val WINDOW_SIZE = 200   // ~20 seconds at 10 Hz
+            // Time-based windows (rate-independent — the fresh-sample rate varies with
+            // the BLE link, so sample-count windows would silently change duration).
+            private const val WINDOW_MS = 20_000L      // running-median span (~several strokes)
+            private const val MAX_WINDOW_SAMPLES = 4000 // hard cap so a burst can't grow it unbounded
+            private const val GYRO_LOOKAHEAD_MS = 300L  // accumulate drive-phase gyro this long after a crossing
+            private const val MIN_GYRO_SAMPLES = 9      // gyro samples per direction before fixing catch phase
             private const val MIN_WINDOW_FOR_MEDIAN = 10
             private const val MIN_CALIB_SAMPLES = 30
             private const val EMA_ALPHA = 0.02     // ~50-sample half-life
             private const val RECALIB_RATIO = 2.0  // other channel must be 2× current
             private const val RECALIB_SAMPLES = 50 // must dominate for 50 consecutive samples (~5s)
-            private const val GYRO_LOOKAHEAD_SAMPLES = 3  // ~300ms at 10 Hz
 
             // Degraded-acquisition gate (mirrors portal max_held_run_frac = 0.30).
             private const val HELD_RUN_FRAC = 0.30 // held > this fraction of a stroke → degraded
@@ -477,7 +510,14 @@ class StrokeAnalyzer {
     ): Long? {
         if (timeMs > lastSampleTimeMs) lastSampleTimeMs = timeMs
         val cal = calibrators[mac] ?: return null
-        val catchTimeMs = cal.onSample(timeMs, fresh, pitch, roll, yaw, wx, wy, wz) ?: return null
+        val catchTimeMs = cal.onSample(timeMs, fresh, pitch, roll, yaw, wx, wy, wz)
+        // Drop a degraded seat's stale lateness from analyzer state too (not just the
+        // display), so getLateness() can never hand back a frozen value.
+        if (cal.degraded) {
+            _lateness.remove(mac)
+            _latenessUpdatedMs.remove(mac)
+        }
+        if (catchTimeMs == null) return null
 
         val refMac = referenceMac ?: return null
         val refCal = calibrators[refMac] ?: return null

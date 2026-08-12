@@ -243,9 +243,13 @@ class IntervalRecordingService : Service() {
         var intervalId: Long = -1L,
         var lastStoredSampleMs: Long = 0L,
         @field:Volatile var lastSeenSampleMs: Long = 0L,
-        var latestSampleMs: Long = 0L,
-        var lastFedBleMs: Long = 0L,   // latestSampleMs last fed to the analyzer — detects held ticks
-        var latestSample: Normalized? = null,
+        // latestSampleMs/latestSample are written on the BLE callback thread and read
+        // on the sampling loop (the `fresh` check + sample snapshot). Volatile so the
+        // loop sees a coherent, current value — a torn/stale read would misclassify a
+        // held tick.
+        @field:Volatile var latestSampleMs: Long = 0L,
+        @field:Volatile var latestSample: Normalized? = null,
+        var lastFedBleMs: Long = 0L,   // only touched by the sampling loop; no barrier needed
         var strokeCount: Int = 0,
         var currentSpm: Int = 0,
         var maxSpm: Int = 0,
