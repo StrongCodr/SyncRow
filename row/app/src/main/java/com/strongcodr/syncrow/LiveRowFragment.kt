@@ -62,12 +62,17 @@ class LiveRowFragment : Fragment() {
                 views.spm.text = "SPM: $spm"
                 views.strokes.text = "Strokes: $strokes"
 
+                // Per-seat gating: name why a seat is unavailable instead of freezing
+                // its last number. "sensor dropout" = held/degraded; "-- ms" = no catch yet.
+                val syncStatus = prefs.getString(syncStatusKey(sensor.mac), null)
                 val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
-                views.lateness?.text = if (latenessMs == Long.MIN_VALUE) {
-                    "Lateness vs Stroke: -- ms"
-                } else {
-                    val sign = if (latenessMs > 0) "+" else ""
-                    "Lateness vs Stroke: $sign${latenessMs} ms"
+                views.lateness?.text = when {
+                    syncStatus == "DEGRADED_SIGNAL" -> "Lateness vs Stroke: sensor dropout"
+                    latenessMs == Long.MIN_VALUE -> "Lateness vs Stroke: -- ms"
+                    else -> {
+                        val sign = if (latenessMs > 0) "+" else ""
+                        "Lateness vs Stroke: $sign${latenessMs} ms"
+                    }
                 }
 
                 spmSum += spm
@@ -539,5 +544,6 @@ class LiveRowFragment : Fragment() {
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
         private fun latenessKey(mac: String) = "live_lateness_$mac"
+        private fun syncStatusKey(mac: String) = "live_syncstatus_$mac"
     }
 }

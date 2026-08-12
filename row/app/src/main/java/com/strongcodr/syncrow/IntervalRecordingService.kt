@@ -32,6 +32,7 @@ import com.strongcodr.syncrow.model.SeatSummary
 import com.strongcodr.syncrow.model.SensorDiagnostic
 import com.strongcodr.syncrow.model.SessionSummary
 import com.strongcodr.syncrow.model.SensorSample
+import com.strongcodr.syncrow.model.SensorSyncStatus
 import com.strongcodr.syncrow.model.SyncStatus
 import com.strongcodr.syncrow.network.ApiClient
 import com.strongcodr.syncrow.storage.DiagnosticsStore
@@ -116,6 +117,7 @@ class IntervalRecordingService : Service() {
         private fun spmKey(mac: String) = "live_spm_$mac"
         private fun connectedKey(mac: String) = "live_connected_$mac"
         private fun latenessKey(mac: String) = "live_lateness_$mac"
+        private fun syncStatusKey(mac: String) = "live_syncstatus_$mac"
         fun hzKey(mac: String) = "live_hz_$mac"
 
         private val nextIntervalId = AtomicLong(System.currentTimeMillis())
@@ -241,8 +243,13 @@ class IntervalRecordingService : Service() {
         var intervalId: Long = -1L,
         var lastStoredSampleMs: Long = 0L,
         @field:Volatile var lastSeenSampleMs: Long = 0L,
-        var latestSampleMs: Long = 0L,
-        var latestSample: Normalized? = null,
+        // latestSampleMs/latestSample are written on the BLE callback thread and read
+        // on the sampling loop (the `fresh` check + sample snapshot). Volatile so the
+        // loop sees a coherent, current value — a torn/stale read would misclassify a
+        // held tick.
+        @field:Volatile var latestSampleMs: Long = 0L,
+        @field:Volatile var latestSample: Normalized? = null,
+        var lastFedBleMs: Long = 0L,   // only touched by the sampling loop; no barrier needed
         var strokeCount: Int = 0,
         var currentSpm: Int = 0,
         var maxSpm: Int = 0,
@@ -459,8 +466,10 @@ class IntervalRecordingService : Service() {
                 val fallbackSeat = seats?.getOrNull(idx) ?: ids.getOrNull(idx) ?: macs[idx]
                 if (fallbackSeat == COX_LABEL) SensorRole.COX else SensorRole.SEAT
             }
-            // Cox sensors get seatIndex = 0; rowers are numbered 1..N from the list end so
-            // the last rower in the list is "seat 1" (stroke reference for StrokeAnalyzer).
+            // Cox = seatIndex 0. Rowers get seatIndex = user-facing seat number (same
+            // formula as SensorLabelBuilder's "Seat N"): first in the list is the
+            // highest number = STROKE, last is seat 1 = bow. StrokeAnalyzer references
+            // the highest seat number (stroke), so seatIndex carries the seat number.
             val rowerCount = rolesResolved.count { it == SensorRole.SEAT }
             var rowerIdx = 0
             return macs.mapIndexedNotNull { idx, mac ->
@@ -553,6 +562,7 @@ class IntervalRecordingService : Service() {
                 existing.lastStoredSampleMs = 0L
                 existing.lastSeenSampleMs = 0L
                 existing.latestSampleMs = 0L
+                existing.lastFedBleMs = 0L
                 existing.latestSample = null
                 existing.detectorState = StrokeState.UNKNOWN
                 existing.stateStartMs = System.currentTimeMillis()
@@ -571,6 +581,7 @@ class IntervalRecordingService : Service() {
                 .putInt(strokesKey(s.mac), 0)
                 .putInt(spmKey(s.mac), 0)
                 .putLong(latenessKey(s.mac), Long.MIN_VALUE)
+                .putString(syncStatusKey(s.mac), SensorSyncStatus.CALIBRATING.name)
                 .apply()
         }
 
@@ -1154,20 +1165,36 @@ class IntervalRecordingService : Service() {
                     sensor.lastStoredSampleMs = nowWall
                     updateStrokeDetector(sensor, nowWall, latest.ax, latest.ay, latest.az)
 
+                    // Fresh iff a new BLE sample arrived since we last fed this sensor.
+                    // If not, latestSample is a zero-order-hold repeat — the analyzer
+                    // skips it and, if held too long, marks the seat DEGRADED_SIGNAL.
+                    val fresh = sensor.latestSampleMs > sensor.lastFedBleMs
+                    sensor.lastFedBleMs = sensor.latestSampleMs
+
                     // Feed to stroke analyzer for catch detection & lateness
                     val lateness = strokeAnalyzer.onSample(
-                        sensor.mac, nowWall,
+                        sensor.mac, nowWall, fresh,
                         latest.pitch, latest.roll, latest.yaw,
                         latest.wx, latest.wy, latest.wz
                     )
+                    val syncStatus = strokeAnalyzer.getStatus(sensor.mac)
 
                     val prefsEdit = prefs.edit()
                         .putString(statusKey(sensor.mac), "RECORDING")
                         .putInt(strokesKey(sensor.mac), sensor.strokeCount)
                         .putInt(spmKey(sensor.mac), sensor.currentSpm)
                         .putBoolean(connectedKey(sensor.mac), true)
-                    if (lateness != null) {
-                        prefsEdit.putLong(latenessKey(sensor.mac), lateness)
+                    // Per-seat gating (rowing seats only; cox has no lateness). Only a
+                    // trustworthy (OK) seat shows a lateness; a degraded/stale seat is
+                    // cleared to "--" so we never display a frozen number — and no other
+                    // seat is affected.
+                    if (sensor.role == SensorRole.SEAT) {
+                        prefsEdit.putString(syncStatusKey(sensor.mac), syncStatus.name)
+                        if (syncStatus == SensorSyncStatus.OK) {
+                            if (lateness != null) prefsEdit.putLong(latenessKey(sensor.mac), lateness)
+                        } else {
+                            prefsEdit.putLong(latenessKey(sensor.mac), Long.MIN_VALUE)
+                        }
                     }
                     prefsEdit.apply()
                 }
