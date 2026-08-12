@@ -14,8 +14,9 @@ import kotlin.math.sqrt
  * and performs median-crossing interpolation for sub-sample catch timing.
  *
  * Once two or more sensors have reported a catch in the same stroke cycle,
- * the analyzer computes Δt (lateness) relative to the reference sensor
- * (seat with the lowest seat index, i.e. the stroke rower).
+ * the analyzer computes Δt (lateness) relative to the reference sensor —
+ * the stroke rower, i.e. the HIGHEST seat number (bow is seat 1). Stroke sets
+ * the rhythm, so it reads 0 and every other seat's lateness is measured to it.
  *
  * PER-SEAT QUALITY GATING (shared spec with the portal, RESEARCH.md §8.5): every
  * seat is judged on its own acquisition and pairing. A seat that spaces out —
@@ -442,17 +443,22 @@ class StrokeAnalyzer {
     /** Most recent sample time seen across all sensors (the "now" for staleness). */
     private var lastSampleTimeMs = 0L
 
-    /** Reference sensor MAC (lowest seat index). */
+    /** Reference sensor MAC (stroke = highest seat index). */
     private var referenceMac: String? = null
 
     /**
-     * Register a sensor. Call once per sensor when the interval starts.
-     * Sensors should be added in seat order (stroke first).
+     * Register a sensor. Call once per sensor when the interval starts. Order does
+     * not matter — the reference is chosen by seat number (highest = stroke).
      */
     @Synchronized
     fun addSensor(mac: String, seatIndex: Int) {
         calibrators[mac] = SensorCalibrator(mac, seatIndex)
-        if (referenceMac == null || seatIndex < (calibrators[referenceMac]?.seatIndex ?: Int.MAX_VALUE)) {
+        // Reference = the STROKE seat = HIGHEST seat number. In rowing, bow is seat 1
+        // and stroke (highest number) sets the rhythm; everyone synchronises to
+        // stroke, so stroke reads 0 lateness. seatIndex here equals the user-facing
+        // "Seat N" number (same formula in SensorLabelBuilder), and this matches the
+        // portal, which also uses the highest seat index as the reference.
+        if (referenceMac == null || seatIndex > (calibrators[referenceMac]?.seatIndex ?: Int.MIN_VALUE)) {
             referenceMac = mac
         }
     }

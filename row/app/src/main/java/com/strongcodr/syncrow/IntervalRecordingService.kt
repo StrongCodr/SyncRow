@@ -462,8 +462,10 @@ class IntervalRecordingService : Service() {
                 val fallbackSeat = seats?.getOrNull(idx) ?: ids.getOrNull(idx) ?: macs[idx]
                 if (fallbackSeat == COX_LABEL) SensorRole.COX else SensorRole.SEAT
             }
-            // Cox sensors get seatIndex = 0; rowers are numbered 1..N from the list end so
-            // the last rower in the list is "seat 1" (stroke reference for StrokeAnalyzer).
+            // Cox = seatIndex 0. Rowers get seatIndex = user-facing seat number (same
+            // formula as SensorLabelBuilder's "Seat N"): first in the list is the
+            // highest number = STROKE, last is seat 1 = bow. StrokeAnalyzer references
+            // the highest seat number (stroke), so seatIndex carries the seat number.
             val rowerCount = rolesResolved.count { it == SensorRole.SEAT }
             var rowerIdx = 0
             return macs.mapIndexedNotNull { idx, mac ->
