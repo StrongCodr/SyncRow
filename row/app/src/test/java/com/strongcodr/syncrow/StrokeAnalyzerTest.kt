@@ -5,7 +5,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Random
 import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.sin
 
 /**
@@ -70,6 +72,31 @@ class StrokeAnalyzerTest {
 
         assertTrue("bow degradation must be detected during the freeze", bowDegradedSeen)
         assertTrue("bow must recover to OK after fresh data resumes", bowOkSeenAfterThaw)
+    }
+
+    @Test
+    fun `noisy stroke yields about one catch per cycle, not double`() {
+        // A single sensor rowing at 30 spm with noise on the pitch signal. The
+        // Schmitt trigger + refractory must give ~one catch per stroke; a bare
+        // median-crossing would roughly double the count on the noise.
+        val a = StrokeAnalyzer()
+        a.addSensor("stroke", 1)
+        val rng = Random(42)
+        var t = 1_000_000L
+        val start = t
+        val dur = 40_000L
+        var catches = 0
+        while (t < start + dur) {
+            val th = 2 * PI * strokeHz * (t / 1000.0)
+            val pitch = (amp * sin(th) + rng.nextGaussian() * 6.0).toFloat() // ~15% noise
+            val wz = if (cos(th) > 0) 300f else 40f  // higher gyro on the drive → phase lock
+            val r = a.onSample("stroke", t, true, pitch, 0f, 0f, 0f, 0f, wz)
+            if (t > start + 15_000L && r != null) catches++  // count after warmup/phase lock
+            t += dtMs
+        }
+        // window = 25 s at 0.5 Hz ≈ 12–13 real strokes. A double-count would be ~25.
+        assertTrue("detected too few catches ($catches) — hysteresis too wide?", catches >= 7)
+        assertTrue("double-counting: $catches catches for ~12 strokes", catches <= 18)
     }
 
     @Test

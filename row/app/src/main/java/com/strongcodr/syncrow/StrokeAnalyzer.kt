@@ -74,6 +74,12 @@ class StrokeAnalyzer {
         private var prevSmoothed = Float.NaN
         private var prevTimeMs = 0L
 
+        /** Schmitt-trigger state: is the signal currently above the median?
+         *  The signal must clear the median by a hysteresis band before this flips,
+         *  so noise wiggles near the median can't fire extra (double) crossings. */
+        private var stateAbove = false
+        private var stateInit = false
+
         /** Small ring buffer for smoothing (3-sample moving average). */
         private val smoothBuf = ArrayDeque<Float>(4)
 
@@ -215,23 +221,37 @@ class StrokeAnalyzer {
                 (a + b) / 2f
             }
 
-            val aboveMedian = smoothed > median
-
-            if (prevSmoothed.isNaN() || prevTimeMs == 0L) {
+            if (prevSmoothed.isNaN() || prevTimeMs == 0L || !stateInit) {
+                stateAbove = smoothed > median
+                stateInit = true
                 prevSmoothed = smoothed
                 prevTimeMs = timeMs
                 return null
             }
 
-            // Check for crossing
-            val prevAbove = prevSmoothed > (median - 0.01f) // small hysteresis
-            if (aboveMedian == prevAbove) {
+            // ── Schmitt-trigger crossing ──
+            // Hysteresis band scales with the stroke swing (IQR of the window), so
+            // the signal must clear the median by ~a quarter-swing before the state
+            // flips. This kills the double-counts a bare median-crossing produces
+            // when a noisy/wobbly signal grazes the median more than once per stroke.
+            val q1 = idToValue[sortedIndices[n / 4]] ?: median
+            val q3 = idToValue[sortedIndices[(3 * n) / 4]] ?: median
+            val h = HYST_FRAC * (q3 - q1)
+            val newAbove = when {
+                smoothed > median + h -> true
+                smoothed < median - h -> false
+                else -> stateAbove          // inside the dead-band → hold state
+            }
+            if (newAbove == stateAbove) {
                 prevSmoothed = smoothed
                 prevTimeMs = timeMs
                 return null
             }
 
-            // ── Crossing detected ──
+            // ── Confirmed crossing ──
+            val crossingUp = newAbove       // just went below → above
+            stateAbove = newAbove
+
             val denom = smoothed - prevSmoothed
             if (abs(denom) < 1e-6f) {
                 prevSmoothed = smoothed
@@ -239,13 +259,13 @@ class StrokeAnalyzer {
                 return null
             }
 
-            // Linear interpolation for sub-sample precision
+            // Linear interpolation for sub-sample precision (at the median level)
             val frac = (median - prevSmoothed) / denom
             val crossingTimeMs = prevTimeMs + (frac * (timeMs - prevTimeMs)).toLong()
 
             // Start gyro lookahead accumulation for this crossing
             gyroLookaheadRemaining = GYRO_LOOKAHEAD_SAMPLES
-            lastCrossingWasUp = aboveMedian
+            lastCrossingWasUp = crossingUp
 
             prevSmoothed = smoothed
             prevTimeMs = timeMs
@@ -264,12 +284,14 @@ class StrokeAnalyzer {
             if (catchIsUpCrossing == null) return null
 
             // Only report if this crossing matches the catch direction
-            val isCatchDirection = if (catchIsUpCrossing == true) aboveMedian else !aboveMedian
+            val isCatchDirection = if (catchIsUpCrossing == true) crossingUp else !crossingUp
             if (!isCatchDirection) return null
 
-            // Adaptive debounce: max(floor, strokePeriod * 0.4)
+            // Refractory period: min gap between catches = a fraction of the stroke
+            // period (mirrors the portal's refractory_frac), floored while no period
+            // is known yet. Backstop to the Schmitt trigger against double-counts.
             val debounceMs = if (strokePeriodMs > 0) {
-                max(DEBOUNCE_FLOOR_MS, (strokePeriodMs * 0.4).toLong())
+                max(DEBOUNCE_FLOOR_MS, (strokePeriodMs * REFRACTORY_FRAC).toLong())
             } else {
                 DEBOUNCE_FLOOR_MS
             }
@@ -296,6 +318,8 @@ class StrokeAnalyzer {
             smoothBuf.clear()
             prevSmoothed = Float.NaN
             prevTimeMs = 0L
+            stateAbove = false
+            stateInit = false
             lastCatchMs = 0L
             prevCatchMs = 0L
             catchCount = 0
@@ -376,6 +400,7 @@ class StrokeAnalyzer {
                     idToValue.clear()
                     smoothBuf.clear()
                     prevSmoothed = Float.NaN
+                    stateInit = false      // re-arm the Schmitt trigger for the new channel
                     // Keep catch times and gyro phase — those are still valid
                 }
             } else {
@@ -395,6 +420,12 @@ class StrokeAnalyzer {
             // Degraded-acquisition gate (mirrors portal max_held_run_frac = 0.30).
             private const val HELD_RUN_FRAC = 0.30 // held > this fraction of a stroke → degraded
             private const val HELD_FLOOR_MS = 500L // ...but at least this, before a period is known
+
+            // Schmitt hysteresis band as a fraction of the window IQR (~a quarter of
+            // the stroke swing) — kills double-counts from a signal grazing the median.
+            private const val HYST_FRAC = 0.20f
+            // Refractory period as a fraction of the stroke (mirrors portal refractory_frac).
+            private const val REFRACTORY_FRAC = 0.55
         }
     }
 
