@@ -582,7 +582,10 @@ class HomeFragment : Fragment() {
                     true
                 }
                 "Remove/replace" -> {
-                    showSimpleSeatDialog("Remove/replace", seatIndex, "Remove/replace option placeholder.")
+                    // Reuse the existing Manage Sensors screen — it already does
+                    // remove (swipe / per-sensor menu -> removeSensor), replace (add
+                    // via FAB), and reassign, and handles sculling's two-per-seat case.
+                    findNavController().navigate(R.id.manageSensorsFragment)
                     true
                 }
                 else -> false
