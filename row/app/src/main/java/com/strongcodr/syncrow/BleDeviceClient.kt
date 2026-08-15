@@ -28,10 +28,10 @@ data class BleDiagnosticSnapshot(
     val lastGattStatus: Int?,
     val configApplied: Boolean,
     val configFailed: Boolean,
-    /** Negotiated link-layer connection interval in milliseconds. Null until the
-     *  framework fires [BluetoothGattCallback.onConnectionUpdated] (API 26+). This is
-     *  the only programmatic source of truth for whether requestConnectionPriority(HIGH)
-     *  was honored — the request itself only returns "queued," not "granted." */
+    /** Negotiated link-layer connection interval in milliseconds. Currently always
+     *  null (dormant): the only source, BluetoothGattCallback.onConnectionUpdated, is
+     *  a hidden/@SystemApi method a normal app can't override. Kept in the schema so
+     *  it renders as "—" and can be re-enabled if a public API appears. */
     val connectionIntervalMs: Double?,
     /** Count of 0x55 0x50 TIME packets received this window. Zero when the time-packet
      *  toggle is off (RSW bit 0 not set). Used to verify whether enabling TIME
@@ -65,7 +65,7 @@ class BleDeviceClient(private val context: Context) {
     private var lastSampleElapsedMs: Long = 0L
     private var lastRssi: Int? = null
     private var lastGattStatus: Int? = null
-    private var lastConnectionIntervalUnits: Int? = null   // 1.25 ms units; null until LL_CONNECTION_UPDATE_IND fires
+    private var lastConnectionIntervalUnits: Int? = null   // 1.25 ms units; always null (dormant — see onConnectionUpdated note)
     private var timeReceived: Int = 0                      // count of 0x55 0x50 packets seen this window
 
     // Config-write sequence tracking. configFailed flips true on any non-success write;
@@ -454,26 +454,11 @@ class BleDeviceClient(private val context: Context) {
                 if (status == BluetoothGatt.GATT_SUCCESS) recordRssi(rssi)
             }
 
-            // Fires whenever the link layer changes the connection interval / latency /
-            // supervision timeout. The only programmatic confirmation of what Android
-            // actually granted in response to requestConnectionPriority().
-            override fun onConnectionUpdated(
-                gatt: BluetoothGatt,
-                interval: Int,
-                latency: Int,
-                timeout: Int,
-                status: Int
-            ) {
-                super.onConnectionUpdated(gatt, interval, latency, timeout, status)
-                if (status == BluetoothGatt.GATT_SUCCESS) recordConnectionInterval(interval)
-                if (DEBUG_BLE) {
-                    Log.d(
-                        tag,
-                        "LL conn updated mac=$macLog interval=${interval}u (${interval * 1.25}ms) " +
-                            "latency=$latency timeoutu=$timeout status=$status"
-                    )
-                }
-            }
+            // NOTE: BluetoothGattCallback.onConnectionUpdated (the LL connection-interval
+            // callback) is a hidden/@SystemApi method — not overridable by a normal app
+            // compiling against the public SDK, so it was removed (it never compiled).
+            // The connectionIntervalMs diagnostic stays null and renders as "—" until a
+            // public API exposes the negotiated interval. See lastConnectionIntervalUnits.
         })
     }
 
@@ -528,11 +513,6 @@ class BleDeviceClient(private val context: Context) {
     @Synchronized
     private fun recordRssi(rssi: Int) {
         lastRssi = rssi
-    }
-
-    @Synchronized
-    private fun recordConnectionInterval(intervalUnits: Int) {
-        lastConnectionIntervalUnits = intervalUnits
     }
 
     @Synchronized
