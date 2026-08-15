@@ -2,6 +2,9 @@ package com.strongcodr.syncrow.model
 
 data class SensorDiagnostic(
     val timestampMs: Long,
+    /** Monotonic elapsed time (SystemClock.elapsedRealtime) at the window tick —
+     *  immune to wall-clock jumps. Defaulted so older stored diagnostics still load. */
+    val elapsedMs: Long = 0L,
     val windowDurationMs: Long,
     val sensorMac: String,
     val sensorId: String?,
