@@ -1176,7 +1176,7 @@ class IntervalRecordingService : Service() {
                     // display uses the analyzer's STORED current offset instead.
                     strokeAnalyzer.onSample(
                         sensor.mac, nowWall, fresh,
-                        latest.pitch, latest.roll, latest.yaw,
+                        latest.ax, latest.ay, latest.az,
                         latest.wx, latest.wy, latest.wz
                     )
                     val syncStatus = strokeAnalyzer.getStatus(sensor.mac)
