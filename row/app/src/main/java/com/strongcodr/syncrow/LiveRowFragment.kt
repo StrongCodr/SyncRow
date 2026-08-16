@@ -67,12 +67,13 @@ class LiveRowFragment : Fragment() {
                 val syncStatus = prefs.getString(syncStatusKey(sensor.mac), null)
                 val latenessMs = prefs.getLong(latenessKey(sensor.mac), Long.MIN_VALUE)
                 views.lateness?.text = when {
-                    syncStatus == "DEGRADED_SIGNAL" -> "Lateness vs Stroke: sensor dropout"
-                    latenessMs == Long.MIN_VALUE -> "Lateness vs Stroke: -- ms"
-                    else -> {
+                    latenessMs != Long.MIN_VALUE -> {
                         val sign = if (latenessMs > 0) "+" else ""
                         "Lateness vs Stroke: $sign${latenessMs} ms"
                     }
+                    syncStatus == "DEGRADED_SIGNAL" -> "Lateness vs Stroke: sensor dropout"
+                    syncStatus == "CALIBRATING" || syncStatus == null -> "Lateness vs Stroke: calibrating…"
+                    else -> "Lateness vs Stroke: waiting for sync…"  // STALE: alive, no recent catch pair
                 }
 
                 spmSum += spm

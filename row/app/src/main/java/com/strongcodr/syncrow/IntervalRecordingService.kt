@@ -1171,8 +1171,10 @@ class IntervalRecordingService : Service() {
                     val fresh = sensor.latestSampleMs > sensor.lastFedBleMs
                     sensor.lastFedBleMs = sensor.latestSampleMs
 
-                    // Feed to stroke analyzer for catch detection & lateness
-                    val lateness = strokeAnalyzer.onSample(
+                    // Feed to stroke analyzer for catch detection & lateness. The
+                    // return is only non-null on the exact catch+pair tick; the
+                    // display uses the analyzer's STORED current offset instead.
+                    strokeAnalyzer.onSample(
                         sensor.mac, nowWall, fresh,
                         latest.pitch, latest.roll, latest.yaw,
                         latest.wx, latest.wy, latest.wz
@@ -1190,8 +1192,13 @@ class IntervalRecordingService : Service() {
                     // seat is affected.
                     if (sensor.role == SensorRole.SEAT) {
                         prefsEdit.putString(syncStatusKey(sensor.mac), syncStatus.name)
-                        if (syncStatus == SensorSyncStatus.OK) {
-                            if (lateness != null) prefsEdit.putLong(latenessKey(sensor.mac), lateness)
+                        // Show the analyzer's stored current offset whenever the seat is
+                        // OK (it's refreshed whenever this seat OR the stroke seat catches),
+                        // so an OK seat always displays its latest lateness. Blank only when
+                        // there's no trustworthy value.
+                        val current = strokeAnalyzer.getLateness(sensor.mac)
+                        if (syncStatus == SensorSyncStatus.OK && current != null) {
+                            prefsEdit.putLong(latenessKey(sensor.mac), current)
                         } else {
                             prefsEdit.putLong(latenessKey(sensor.mac), Long.MIN_VALUE)
                         }
