@@ -1,9 +1,10 @@
 package com.strongcodr.syncrow
 
 import com.strongcodr.syncrow.model.SensorSyncStatus
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
-import kotlin.math.ln
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -16,8 +17,10 @@ import kotlin.math.sqrt
  *      against gravity, deterministic sign. Gyro projected onto `sweep` = a signed
  *      1-D stroke signal — INDEPENDENT of how the sensor is mounted on the oar.
  *   2. Catch detection: running-median crossing + Schmitt hysteresis + refractory.
- *   3. Cross-sensor offset: per reference stroke, windowed cross-correlation of the
- *      projected signals (sign-aligned first), Gaussian peak interpolation → ms.
+ *   3. Cross-sensor offset: per reference stroke, the difference in FUNDAMENTAL PHASE
+ *      of the sign-aligned projected signals (a single-bin DFT at the stroke rate).
+ *      Harmonic-immune — a plain cross-correlation locks onto the wrong peak when the
+ *      gyro waveform is harmonic-rich (which real rowing is).
  *
  * Reference = the STROKE seat = HIGHEST seat number; it reads 0, everyone else is
  * measured against it.
@@ -28,7 +31,10 @@ import kotlin.math.sqrt
  *   - Each reference stroke's offset uses a window CENTRED on the catch (half a
  *     stroke either side), identical to the portal — but we must wait until that
  *     forward half has arrived, so a stroke's offset appears ~half a stroke (~1.2s)
- *     after it happens. A display latency, not a change to the number.
+ *     after it happens. A display latency, not a change to the number. (Consequence:
+ *     the final ~1 stroke of a piece never gets its forward half, so it's absent from
+ *     the running median — invisible on a live display, accepted; the portal recompute
+ *     is authoritative for the full piece.)
  *
  * Validated against synthetic ground truth (StrokeAnalyzerTest) the same way the
  * portal is: inject known per-seat offsets through arbitrary mountings, recover them.
@@ -60,6 +66,13 @@ class StrokeAnalyzer {
         var domHz = 0.0
         var estPeriodMs = 0L      // robust stroke period (autocorrelation); 0 = none
         private var lastAxisMs = 0L
+
+        // cached median + hysteresis band (refreshed every STATS_REFRESH samples, not
+        // every sample — they drift slowly, and full-sorting the buffer per sample is the
+        // hot-path cost with many sensors)
+        private var cMedian = 0.0
+        private var cHyst = 0.0
+        private var statsCountdown = 0
 
         // catch detection state (Schmitt on the projected signal)
         private var stateAbove = false
@@ -93,7 +106,8 @@ class StrokeAnalyzer {
             buf.clear()
             down = doubleArrayOf(0.0, 0.0, 1.0); sweep = doubleArrayOf(1.0, 0.0, 0.0)
             gMean = doubleArrayOf(0.0, 0.0, 0.0); axisReady = false; sweepEnergy = 0.0; domHz = 0.0
-            lastAxisMs = 0L
+            estPeriodMs = 0L; lastAxisMs = 0L
+            cMedian = 0.0; cHyst = 0.0; statsCountdown = 0
             stateAbove = false; stateInit = false; prevAboveRaw = false
             prevSig = Double.NaN; prevT = 0L
             lastRawCrossMs = 0L; lastRawCrossUp = false; haveRawCross = false
@@ -160,34 +174,47 @@ class StrokeAnalyzer {
             val (evals, evecs) = jacobiEigenDesc(c)
             if (evals[0] <= EPS) return
 
-            // feather rejection: prefer PC1 if it has an in-band stroke period, else PC2
+            // feather rejection: prefer PC1 if it has an in-band stroke period, else PC2.
+            // Compute the chosen axis's period ONCE and reuse it (sweep ≈ chosen after
+            // orthogonalisation, so its period is the same) — avoids a 3rd periodOfAxis.
             val pc1 = doubleArrayOf(evecs[0][0], evecs[1][0], evecs[2][0])
             val pc2 = doubleArrayOf(evecs[0][1], evecs[1][1], evecs[2][1])
             var chosen = pc1
-            if (periodOfAxis(gmx, gmy, gmz, pc1) == 0L) {
-                if (periodOfAxis(gmx, gmy, gmz, pc2) != 0L) chosen = pc2
+            var chosenPeriod = periodOfAxis(gmx, gmy, gmz, pc1)
+            if (chosenPeriod == 0L) {
+                val p2 = periodOfAxis(gmx, gmy, gmz, pc2)
+                if (p2 != 0L) { chosen = pc2; chosenPeriod = p2 }
             }
 
-            // orthogonalise against gravity, normalise, deterministic sign
+            // orthogonalise against gravity, normalise
             val dot = chosen[0] * dn[0] + chosen[1] * dn[1] + chosen[2] * dn[2]
             var sx = chosen[0] - dot * dn[0]; var sy = chosen[1] - dot * dn[1]; var sz = chosen[2] - dot * dn[2]
             val sn = sqrt(sx * sx + sy * sy + sz * sz)
             if (sn <= EPS) return
             sx /= sn; sy /= sn; sz /= sn
             val sv = doubleArrayOf(sx, sy, sz)
-            val ai = if (abs(sx) >= abs(sy) && abs(sx) >= abs(sz)) 0 else if (abs(sy) >= abs(sz)) 1 else 2
-            if (sv[ai] < 0) { sv[0] = -sv[0]; sv[1] = -sv[1]; sv[2] = -sv[2] }
+            // SIGN CONTINUITY: keep the sign consistent with the PREVIOUS sweep so the
+            // projected signal never inverts between recomputes (an inversion mid-stream
+            // corrupts the running detection state -> spurious/missed catches). Only the
+            // very first axis uses the deterministic (largest-component-positive) rule.
+            if (axisReady) {
+                if (sv[0] * sweep[0] + sv[1] * sweep[1] + sv[2] * sweep[2] < 0) {
+                    sv[0] = -sv[0]; sv[1] = -sv[1]; sv[2] = -sv[2]
+                }
+            } else {
+                val ai = if (abs(sx) >= abs(sy) && abs(sx) >= abs(sz)) 0 else if (abs(sy) >= abs(sz)) 1 else 2
+                if (sv[ai] < 0) { sv[0] = -sv[0]; sv[1] = -sv[1]; sv[2] = -sv[2] }
+            }
 
             down = dn; sweep = sv; gMean = doubleArrayOf(gmx, gmy, gmz)
 
-            // amplitude (deg/s) + dominant frequency of the projected signal
             var sumSq = 0.0
             for (s in buf) {
                 val p = (s.gx - gmx) * sv[0] + (s.gy - gmy) * sv[1] + (s.gz - gmz) * sv[2]
                 sumSq += p * p
             }
             sweepEnergy = sqrt(sumSq / n)
-            estPeriodMs = periodOfAxis(gmx, gmy, gmz, sv)
+            estPeriodMs = chosenPeriod
             domHz = if (estPeriodMs > 0) 1000.0 / estPeriodMs else 0.0
             axisReady = true
         }
@@ -237,14 +264,19 @@ class StrokeAnalyzer {
          *  trigger (dead-band scaled to the stroke swing) decides WHETHER to emit;
          *  refractory rejects doubles. */
         private fun detect(t: Long, sig: Double): Long? {
-            // running median + IQR over the trailing window of projected values
-            val vals = DoubleArray(buf.size) { buf.elementAt(it).sig }
-            if (vals.size < MIN_WINDOW_FOR_MEDIAN) return null
-            vals.sort()
-            val nn = vals.size
-            val median = if (nn % 2 == 1) vals[nn / 2] else (vals[nn / 2 - 1] + vals[nn / 2]) / 2.0
-            val q1 = vals[nn / 4]; val q3 = vals[(3 * nn) / 4]
-            val h = HYST_FRAC * (q3 - q1)
+            if (buf.size < MIN_WINDOW_FOR_MEDIAN) return null
+            // running median + IQR, refreshed every STATS_REFRESH samples (they drift
+            // slowly) instead of a full sort every sample.
+            if (statsCountdown <= 0) {
+                val vals = DoubleArray(buf.size) { buf.elementAt(it).sig }
+                vals.sort()
+                val nn = vals.size
+                cMedian = if (nn % 2 == 1) vals[nn / 2] else (vals[nn / 2 - 1] + vals[nn / 2]) / 2.0
+                cHyst = HYST_FRAC * (vals[(3 * nn) / 4] - vals[nn / 4])
+                statsCountdown = STATS_REFRESH
+            }
+            statsCountdown--
+            val median = cMedian; val h = cHyst
 
             // gyro-after accumulation to fix catch phase
             if (t <= lookaheadUntil) {
@@ -394,32 +426,37 @@ class StrokeAnalyzer {
             pending.removeFirst()
 
             val t0 = p.tRef - p.halfMs; val t1 = p.tRef + p.halfMs
+            val f0 = 1000.0 / (2.0 * p.halfMs)                 // fundamental Hz (period = 2*half)
             val refWin = refTrack.resample(t0, t1, XCORR_GRID_HZ) ?: continue
+            val refPhase = fundamentalPhase(refWin, f0, XCORR_GRID_HZ) ?: continue
             _lateness[ref] = 0L; _latenessUpdatedMs[ref] = p.tRef; _corr[ref] = 1.0
 
-            val offsets = ArrayList<Double>()
-            offsets.add(0.0)
             for ((mac, track) in tracks) {
                 if (mac == ref || !isRowing(track)) continue
                 var win = track.resample(t0, t1, XCORR_GRID_HZ) ?: continue
-                // Sign-align: an arbitrarily-mounted sensor's synthetic axis may be
-                // anti-phase to the stroke's. Flip it (portal align_signs) BEFORE the
-                // cross-correlation, else the peak lands a half-stroke off. Zero-lag
-                // correlation sign, on mean-removed windows.
+                // Sign-align first: an arbitrarily-mounted sensor's synthetic axis may be
+                // anti-phase to the stroke's, which would shift the fundamental phase by
+                // pi (a half-period offset error). Flip via the zero-lag correlation sign.
                 if (signOfCorr(refWin, win) < 0) win = DoubleArray(win.size) { -win[it] }
-                val est = gaussianLag(refWin, win, XCORR_GRID_HZ, p.halfMs * XCORR_MAXLAG_FRAC / 1000.0)
-                    ?: continue
-                _corr[mac] = est.rho
+                val seatPhase = fundamentalPhase(win, f0, XCORR_GRID_HZ) ?: continue
+                // Offset from the FUNDAMENTAL phase difference — harmonic-immune. A strong
+                // 2x harmonic makes the raw waveform double-peaked and lets a plain x-corr
+                // lock onto the wrong peak (a confident-but-wrong lag); the fundamental
+                // phase ignores harmonics entirely. Phase wraps at one period, so a real
+                // (sub-period) crew offset is unambiguous.
+                var dphi = seatPhase.phase - refPhase.phase
+                while (dphi > PI) dphi -= 2.0 * PI
+                while (dphi < -PI) dphi += 2.0 * PI
+                val offMs = dphi / (2.0 * PI * f0) * 1000.0
+                // confidence = how well each window is a clean fundamental oscillation
+                val rho = minOf(refPhase.coherence, seatPhase.coherence)
+                _corr[mac] = rho
                 _latenessUpdatedMs[mac] = p.tRef
-                val offMs = est.lagS * 1000.0
-                offsets.add(offMs)
-                // display a MEDIAN of recent trustworthy strokes (like the portal) so one
-                // weak-match stroke can't flick the number to a wild value.
-                if (est.rho >= MIN_CORR) {
+                if (rho >= MIN_CORR) {
                     val ring = _recent.getOrPut(mac) { ArrayDeque() }
                     ring.addLast(offMs)
                     while (ring.size > RECENT_STROKES) ring.removeFirst()
-                    _lateness[mac] = Math.round(median(ring))
+                    _lateness[mac] = Math.round(median(ring))  // stable median, like the portal
                 }
             }
         }
@@ -448,9 +485,9 @@ class StrokeAnalyzer {
     @Synchronized
     fun isCalibrated(mac: String): Boolean = tracks[mac]?.axisReady == true
 
-    /** Internal state, for diagnostics/replay. */
+    /** Internal state, for diagnostics/replay/tests only (not part of the app API). */
     @Synchronized
-    fun debugState(mac: String): String {
+    internal fun debugState(mac: String): String {
         val t = tracks[mac] ?: return "no track"
         return "axis=${t.axisReady} sweepE=${"%.1f".format(t.sweepEnergy)} domHz=${"%.3f".format(t.domHz)} " +
             "catches=${t.catchCount} rowing=${isRowing(t)} buf=${t.buf.size} " +
@@ -474,44 +511,68 @@ class StrokeAnalyzer {
 
     // ─────────────────────────────── math ───────────────────────────────────
 
-    class LagEst(val lagS: Double, val rho: Double)
-
     companion object {
         private const val EPS = 1e-9
 
-        // frame / detection (mirror portal config + validity)
-        private const val WINDOW_MS = 20_000L
-        private const val MIN_SAMPLES = 30
-        private const val AXIS_REFRESH_MS = 500L
+        // ─── SHARED SPEC — these MUST match the portal (SyncRow_Portal srow/analysis
+        //     config.py + validity.py). If you change one, change it there too, and vice
+        //     versa; drift here silently makes the phone show strokes the portal drops. ──
+        private const val BAND_LO = 0.2                // validity.STROKE_BAND_HZ
+        private const val BAND_HI = 0.84               // validity.STROKE_BAND_HZ
+        private const val MIN_SWEEP_ENERGY = 10.0      // validity.MIN_SWEEP_ENERGY_DEG_S
+        private const val REFRACTORY_FRAC = 0.55       // config.refractory_frac
+        private const val HELD_RUN_FRAC = 0.30         // config.max_held_run_frac
+        private const val XCORR_WINDOW_FRAC = 0.5      // config.xcorr_window_frac (half-window = this * period)
+
+        // ─── PHONE-ONLY — real-time tier has no portal equivalent (the portal is batch). ──
+        private const val WINDOW_MS = 20_000L          // trailing PCA/detection window
+        private const val MIN_SAMPLES = 30             // min fresh samples before an axis
+        private const val AXIS_REFRESH_MS = 500L       // recompute the synthetic axis this often
         private const val MIN_WINDOW_FOR_MEDIAN = 10
-        private const val PERIOD_HZ = 25.0          // uniform grid for the autocorrelation period
-        private const val AUTOCORR_MIN = 0.30       // min autocorrelation to accept a stroke period
-        private const val HYST_FRAC = 0.20
-        private const val REFRACTORY_FRAC = 0.55
+        private const val STATS_REFRESH = 8            // recompute median/IQR every N samples
+        private const val PERIOD_HZ = 25.0             // uniform grid for the autocorrelation period
+        private const val AUTOCORR_MIN = 0.30          // min autocorrelation to accept a stroke period
+        private const val HYST_FRAC = 0.20             // Schmitt band as a fraction of the IQR
         private const val REFRACTORY_FLOOR_MS = 500L
         private const val GYRO_LOOKAHEAD_MS = 300L
         private const val MIN_GYRO_SAMPLES = 6
-        private const val HELD_RUN_FRAC = 0.30
         private const val HELD_FLOOR_MS = 500L
-
-        // cross-sensor
-        private const val XCORR_GRID_HZ = 100.0
-        private const val XCORR_WINDOW_FRAC = 0.5      // half-window = this * stroke period
-        private const val XCORR_MAXLAG_FRAC = 0.60     // max searched lag as frac of half-window
+        private const val XCORR_GRID_HZ = 100.0        // resample grid for the phase estimate
         private const val XCORR_MARGIN_MS = 120L       // wait a touch past the window edge
+        // NOTE: the phone gates on fundamental COHERENCE (energy fraction in f0), which is
+        // analogous to but NOT the same quantity as the portal's x-corr rho (config.min_corr).
+        // Phone-tuned; do not assume it must equal the portal value.
         private const val MIN_CORR = 0.5
-        private const val RECENT_STROKES = 7        // median window for the displayed lateness
-
-        // stroke validity (shared spec)
-        private const val BAND_LO = 0.2
-        private const val BAND_HI = 0.84
-        private const val MIN_SWEEP_ENERGY = 10.0      // deg/s std of the projection
-
-        // status
-        private const val STALE_WINDOW_MS = 6000L
+        private const val RECENT_STROKES = 7           // median window for the displayed lateness
+        private const val STALE_WINDOW_MS = 6000L      // no paired offset within this -> STALE
 
         private fun inStrokeBand(hz: Double) = hz in BAND_LO..BAND_HI
         private fun maxL(a: Long, b: Long) = if (a > b) a else b
+
+        class Phase(val phase: Double, val coherence: Double)
+
+        /** Fundamental phase of `x` (sampled at `hz`) at frequency `f0`, via a single-bin
+         *  DFT (Goertzel-style). `coherence` is the share of the signal that IS that
+         *  fundamental (amplitude/RMS, 0..1) — the confidence that this window is a clean
+         *  stroke oscillation. Harmonic content contributes to RMS but not to the f0 bin,
+         *  so a harmonic-rich signal has a well-defined fundamental phase and lower
+         *  coherence — exactly what we want. */
+        fun fundamentalPhase(x: DoubleArray, f0: Double, hz: Double): Phase? {
+            val n = x.size
+            if (n < 8 || f0 <= 0) return null
+            var mean = 0.0; for (v in x) mean += v; mean /= n
+            var re = 0.0; var im = 0.0; var ss = 0.0
+            for (k in 0 until n) {
+                val ang = 2.0 * PI * f0 * k / hz
+                val v = x[k] - mean
+                re += v * cos(ang); im += v * sin(ang); ss += v * v
+            }
+            if (ss < EPS) return null
+            val amp = 2.0 * sqrt(re * re + im * im) / n            // fundamental amplitude
+            val rms = sqrt(ss / n)
+            val coh = (amp / (rms * sqrt(2.0))).coerceIn(0.0, 1.0) // 1 for a pure sinusoid
+            return Phase(atan2(im, re), coh)
+        }
 
         fun median(xs: Collection<Double>): Double {
             val s = xs.sorted(); val n = s.size
@@ -530,50 +591,6 @@ class StrokeAnalyzer {
             return if (s < 0) -1.0 else 1.0
         }
 
-        /**
-         * Sub-sample lag of `other` vs `ref` by cross-correlation with Gaussian peak
-         * interpolation, plus the normalized peak correlation (match confidence).
-         * Positive lag => `other` lags (is later than) `ref`. Port of the portal's
-         * gaussian_lag; verified by test.
-         */
-        fun gaussianLag(ref: DoubleArray, other: DoubleArray, fs: Double, maxLagS: Double): LagEst? {
-            val n = minOf(ref.size, other.size)
-            if (n < 8 || fs <= 0) return null
-            var ma = 0.0; var mb = 0.0
-            for (i in 0 until n) { ma += ref[i]; mb += other[i] }
-            ma /= n; mb /= n
-            val a = DoubleArray(n) { ref[it] - ma }
-            val b = DoubleArray(n) { other[it] - mb }
-            var na = 0.0; var nb = 0.0
-            for (i in 0 until n) { na += a[i] * a[i]; nb += b[i] * b[i] }
-            na = sqrt(na); nb = sqrt(nb)
-            if (na <= EPS || nb <= EPS) return null
-
-            val maxLag = (maxLagS * fs).toInt().coerceIn(1, n - 1)
-            var bestLag = 0; var bestCorr = Double.NEGATIVE_INFINITY
-            val corrAt = HashMap<Int, Double>()
-            for (lag in -maxLag..maxLag) {
-                // s(lag) = Σ ref[i] * other[i+lag]; peak lag is POSITIVE when `other`
-                // is delayed (later) than `ref` — verified in test.
-                var s = 0.0
-                for (i in 0 until n) {
-                    val j = i + lag
-                    if (j in 0 until n) s += a[i] * b[j]
-                }
-                corrAt[lag] = s
-                if (s > bestCorr) { bestCorr = s; bestLag = lag }
-            }
-            val rho = (bestCorr / (na * nb)).coerceIn(-1.0, 1.0)
-            val ym1 = corrAt[bestLag - 1]; val y0 = corrAt[bestLag]; val yp1 = corrAt[bestLag + 1]
-            var lag = bestLag.toDouble()
-            if (ym1 != null && yp1 != null && ym1 > 0 && y0 != null && y0 > 0 && yp1 > 0) {
-                val lm1 = ln(ym1); val l0 = ln(y0); val lp1 = ln(yp1)
-                val denom = lm1 - 2 * l0 + lp1
-                if (denom != 0.0) lag = bestLag + 0.5 * (lm1 - lp1) / denom
-            }
-            // convention: + lag of `a` under `b` => other later => positive ms
-            return LagEst(lag / fs, rho)
-        }
 
         /**
          * Eigen-decomposition of a symmetric 3×3 matrix via cyclic Jacobi rotations.

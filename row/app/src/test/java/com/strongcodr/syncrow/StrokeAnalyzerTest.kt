@@ -16,7 +16,7 @@ import kotlin.math.sqrt
  * test_pipeline_recovers_injected_offsets: inject known per-seat offsets through
  * ARBITRARY sensor mountings and assert the phone recovers them (right sign +
  * magnitude). Plus the exact real-world failing case (two sensors, same motion in
- * one hand → ~0 ms), and unit checks on the math (Jacobi eigen, gaussianLag sign).
+ * one hand → ~0 ms), harmonic-immunity, and unit checks (Jacobi eigen, phase sign).
  */
 class StrokeAnalyzerTest {
 
@@ -149,14 +149,19 @@ class StrokeAnalyzerTest {
     // ─── math unit checks ───────────────────────────────────────────────────────
 
     @Test
-    fun `gaussianLag sign - later signal gives positive lag`() {
-        val n = 400
-        val ref = DoubleArray(n) { sin(2 * PI * it / 40.0) }
-        val later = DoubleArray(n) { sin(2 * PI * (it - 3) / 40.0) } // delayed 3 samples
-        val est = StrokeAnalyzer.gaussianLag(ref, later, 50.0, 0.5)!!
-        assertTrue("later signal must give +lag, got ${est.lagS}", est.lagS > 0)
-        assertEquals(3.0 / 50.0, est.lagS, 0.008)
-        assertTrue("clean match => high rho", est.rho > 0.95)
+    fun `fundamentalPhase offset sign - later signal is positive`() {
+        val hz = 100.0; val f0 = 0.5; val n = 400
+        val ref = DoubleArray(n) { sin(2 * PI * f0 * it / hz) }
+        val later = DoubleArray(n) { sin(2 * PI * f0 * (it - 5) / hz) } // delayed 5 samples = 50ms
+        val pr = StrokeAnalyzer.fundamentalPhase(ref, f0, hz)!!
+        val pl = StrokeAnalyzer.fundamentalPhase(later, f0, hz)!!
+        var dphi = pl.phase - pr.phase
+        while (dphi > PI) dphi -= 2 * PI
+        while (dphi < -PI) dphi += 2 * PI
+        val offMs = dphi / (2 * PI * f0) * 1000.0
+        assertTrue("later signal => +offset, got $offMs", offMs > 0)
+        assertEquals(50.0, offMs, 5.0)
+        assertTrue("clean sinusoid => coherence ~1", pr.coherence > 0.9)
     }
 
     @Test
