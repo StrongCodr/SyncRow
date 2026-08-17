@@ -117,19 +117,15 @@ class StrokeAnalyzer {
             return if (med in loP..hiP) med else 0L
         }
 
-        // Displayed stroke count/rate come from the ROBUST period (estPeriodMs), not from
-        // counting spike-prone crossings: integrate rate over rowing time. domHz is
-        // identical across seats and dead-on where catch counts disagree.
-        var strokeAccum = 0.0     // fractional strokes accumulated while rowing
-        private var prevFreshT = 0L
-        val strokeCount: Int get() = strokeAccum.toInt()
-        val spm: Int get() = if (estPeriodMs > 0) (60000.0 / estPeriodMs).toInt() else 0
-
-        fun accumulateStrokes(now: Long) {
-            if (estPeriodMs > 0 && sweepEnergy >= MIN_SWEEP_ENERGY && prevFreshT > 0L) {
-                strokeAccum += (now - prevFreshT).toDouble() / estPeriodMs
-            }
-            prevFreshT = now
+        // Displayed count + rate = the actual detected strokes (catches) and their
+        // cadence — a straight count, ticking once per stroke.
+        val strokeCount: Int get() = catchCount
+        val spm: Int get() {
+            if (catchTimes.size < 3) return 0
+            val d = ArrayList<Double>(catchTimes.size - 1); var p = -1L
+            for (c in catchTimes) { if (p > 0) d.add((c - p).toDouble()); p = c }
+            val med = median(d)
+            return if (med > 0) (60000.0 / med).toInt().coerceIn(0, 120) else 0
         }
 
         // held / degraded
@@ -149,7 +145,6 @@ class StrokeAnalyzer {
             catchIsUp = null; gyroAfterUp = 0.0; nAfterUp = 0; gyroAfterDown = 0.0; nAfterDown = 0
             lookaheadUntil = 0L; lastCrossUp = false
             lastCatchMs = 0L; prevCatchMs = 0L; catchCount = 0; catchTimes.clear()
-            strokeAccum = 0.0; prevFreshT = 0L
             lastFreshMs = 0L; heldMs = 0L; degraded = false
         }
 
@@ -168,7 +163,6 @@ class StrokeAnalyzer {
             while (buf.isNotEmpty() && s.t - buf.first().t > WINDOW_MS) buf.removeFirst()
 
             recomputeAxisIfDue(s.t)
-            accumulateStrokes(s.t)          // count/rate from the robust period, every fresh sample
             if (!axisReady) return null
 
             // project this sample onto the sweep axis (gyro, mean-removed)
