@@ -224,7 +224,6 @@ class IntervalRecordingService : Service() {
     }
 
     private enum class StopReason { USER_STOP, RECENTS_REMOVED }
-    private enum class StrokeState { FORWARD, BACKWARD, UNKNOWN }
 
     // Mix of threads touches this: BLE binder callbacks (connected/lastSeen/*), coroutine
     // scopes (everything else). @field:Volatile on the fields read cross-thread without
@@ -239,7 +238,6 @@ class IntervalRecordingService : Service() {
         var role: SensorRole = SensorRole.SEAT,
         val client: BleDeviceClient,
         val samples: MutableList<SensorSample> = mutableListOf(),
-        val strokeTimesMs: ArrayDeque<Long> = ArrayDeque(64),
         var intervalId: Long = -1L,
         var lastStoredSampleMs: Long = 0L,
         @field:Volatile var lastSeenSampleMs: Long = 0L,
@@ -250,10 +248,9 @@ class IntervalRecordingService : Service() {
         @field:Volatile var latestSampleMs: Long = 0L,
         @field:Volatile var latestSample: Normalized? = null,
         var lastFedBleMs: Long = 0L,   // only touched by the sampling loop; no barrier needed
-        var strokeCount: Int = 0,
-        var currentSpm: Int = 0,
+        var strokeCount: Int = 0,      // populated from StrokeAnalyzer (period-derived)
+        var currentSpm: Int = 0,       // populated from StrokeAnalyzer
         var maxSpm: Int = 0,
-        var detectorState: StrokeState = StrokeState.UNKNOWN,
         var stateStartMs: Long = 0L,
         @field:Volatile var connected: Boolean = false,
         var reconnectJobActive: Boolean = false,
@@ -287,8 +284,6 @@ class IntervalRecordingService : Service() {
     private var intervalStartElapsedMs: Long = 0L
 
     private val targetSamplePeriodMs = 10L // ~100 Hz
-    private val minPhaseMs = 140L
-    private val accelDeadband = 0.10f
 
     private var appIsForeground = true
     private var backgroundSinceMs: Long = 0L
@@ -555,7 +550,6 @@ class IntervalRecordingService : Service() {
                 existing.role = s.role
                 existing.intervalId = sessionIntervalId
                 existing.samples.clear()
-                existing.strokeTimesMs.clear()
                 existing.strokeCount = 0
                 existing.currentSpm = 0
                 existing.maxSpm = 0
@@ -564,7 +558,6 @@ class IntervalRecordingService : Service() {
                 existing.latestSampleMs = 0L
                 existing.lastFedBleMs = 0L
                 existing.latestSample = null
-                existing.detectorState = StrokeState.UNKNOWN
                 existing.stateStartMs = System.currentTimeMillis()
                 connectSensor(existing)
             }
@@ -1163,7 +1156,6 @@ class IntervalRecordingService : Service() {
                         )
                     )
                     sensor.lastStoredSampleMs = nowWall
-                    updateStrokeDetector(sensor, nowWall, latest.ax, latest.ay, latest.az)
 
                     // Fresh iff a new BLE sample arrived since we last fed this sensor.
                     // If not, latestSample is a zero-order-hold repeat — the analyzer
@@ -1180,6 +1172,12 @@ class IntervalRecordingService : Service() {
                         latest.wx, latest.wy, latest.wz
                     )
                     val syncStatus = strokeAnalyzer.getStatus(sensor.mac)
+                    // Stroke count + rate now come from the ONE unified engine (period-
+                    // derived, immune to feather/reversal spikes) — not a second accel
+                    // detector. Cox isn't in the analyzer, so it reads 0 (correct).
+                    sensor.strokeCount = strokeAnalyzer.getStrokeCount(sensor.mac)
+                    sensor.currentSpm = strokeAnalyzer.getSpm(sensor.mac)
+                    if (sensor.currentSpm > sensor.maxSpm) sensor.maxSpm = sensor.currentSpm
 
                     val prefsEdit = prefs.edit()
                         .putString(statusKey(sensor.mac), "RECORDING")
@@ -1705,60 +1703,10 @@ class IntervalRecordingService : Service() {
         }
     }
 
-    private fun updateStrokeDetector(sensor: ActiveSensor, nowMs: Long, ax: Float, ay: Float, az: Float) {
-        val dominant = listOf(ax, ay, az).maxByOrNull { kotlin.math.abs(it) } ?: 0f
-        val v = when {
-            dominant > accelDeadband -> dominant
-            dominant < -accelDeadband -> dominant
-            else -> 0f
-        }
-
-        val newState = when {
-            v > 0f -> StrokeState.FORWARD
-            v < 0f -> StrokeState.BACKWARD
-            else -> sensor.detectorState
-        }
-
-        if (sensor.detectorState == StrokeState.UNKNOWN) {
-            sensor.detectorState = newState
-            sensor.stateStartMs = nowMs
-            return
-        }
-
-        if (newState == sensor.detectorState) return
-
-        val phaseDuration = nowMs - sensor.stateStartMs
-        if (phaseDuration < minPhaseMs) return
-
-        if (sensor.detectorState == StrokeState.BACKWARD && newState == StrokeState.FORWARD) {
-            sensor.strokeCount++
-            sensor.strokeTimesMs.addLast(nowMs)
-            while (sensor.strokeTimesMs.size > 30) sensor.strokeTimesMs.removeFirst()
-            sensor.currentSpm = computeSpm(sensor)
-            if (sensor.currentSpm > sensor.maxSpm) sensor.maxSpm = sensor.currentSpm
-        }
-
-        sensor.detectorState = newState
-        sensor.stateStartMs = nowMs
-    }
-
-    private fun computeSpm(sensor: ActiveSensor): Int {
-        if (sensor.strokeTimesMs.size < 2) return 0
-
-        val now = System.currentTimeMillis()
-        val windowMs = 7_000L
-        while (sensor.strokeTimesMs.isNotEmpty() && (now - sensor.strokeTimesMs.first()) > windowMs) {
-            sensor.strokeTimesMs.removeFirst()
-        }
-        if (sensor.strokeTimesMs.size < 2) return 0
-
-        val first = sensor.strokeTimesMs.first()
-        val last = sensor.strokeTimesMs.last()
-        val dt = last - first
-        if (dt <= 0) return 0
-        val strokes = sensor.strokeTimesMs.size - 1
-        return (strokes * 60_000.0 / dt).toInt().coerceIn(0, 120)
-    }
+    // (Retired: the old accelerometer "dominant-axis sign-flip" stroke detector.
+    //  Stroke count + rate now come from the unified StrokeAnalyzer — synthetic axis
+    //  + robust period — so there is ONE detector, and the count is immune to the
+    //  feather/hand-reversal spikes that made the accel version double up on sculling.)
 
     private fun normalizeBySeat(
         seatIndex: Int,

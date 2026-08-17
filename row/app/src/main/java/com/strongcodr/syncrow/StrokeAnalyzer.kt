@@ -51,7 +51,8 @@ class StrokeAnalyzer {
         val ax: Double, val ay: Double, val az: Double,
         val gx: Double, val gy: Double, val gz: Double,
     ) {
-        var sig: Double = 0.0   // gyro projected onto the current sweep axis
+        var sig: Double = 0.0    // gyro projected onto the current sweep axis (raw, for the phase/offset)
+        var sigS: Double = 0.0   // smoothed projection, for catch DETECTION only
     }
 
     private class Track(val seatIndex: Int) {
@@ -97,6 +98,21 @@ class StrokeAnalyzer {
         val periodMs: Long
             get() = if (prevCatchMs > 0 && lastCatchMs > prevCatchMs) lastCatchMs - prevCatchMs else 0L
 
+        // Displayed stroke count/rate come from the ROBUST period (estPeriodMs), not from
+        // counting spike-prone crossings: integrate rate over rowing time. domHz is
+        // identical across seats and dead-on where catch counts disagree.
+        var strokeAccum = 0.0     // fractional strokes accumulated while rowing
+        private var prevFreshT = 0L
+        val strokeCount: Int get() = strokeAccum.toInt()
+        val spm: Int get() = if (estPeriodMs > 0) (60000.0 / estPeriodMs).toInt() else 0
+
+        fun accumulateStrokes(now: Long) {
+            if (estPeriodMs > 0 && sweepEnergy >= MIN_SWEEP_ENERGY && prevFreshT > 0L) {
+                strokeAccum += (now - prevFreshT).toDouble() / estPeriodMs
+            }
+            prevFreshT = now
+        }
+
         // held / degraded
         private var lastFreshMs = 0L
         var heldMs = 0L; private set
@@ -114,6 +130,7 @@ class StrokeAnalyzer {
             catchIsUp = null; gyroAfterUp = 0.0; nAfterUp = 0; gyroAfterDown = 0.0; nAfterDown = 0
             lookaheadUntil = 0L; lastCrossUp = false
             lastCatchMs = 0L; prevCatchMs = 0L; catchCount = 0
+            strokeAccum = 0.0; prevFreshT = 0L
             lastFreshMs = 0L; heldMs = 0L; degraded = false
         }
 
@@ -132,12 +149,29 @@ class StrokeAnalyzer {
             while (buf.isNotEmpty() && s.t - buf.first().t > WINDOW_MS) buf.removeFirst()
 
             recomputeAxisIfDue(s.t)
+            accumulateStrokes(s.t)          // count/rate from the robust period, every fresh sample
             if (!axisReady) return null
 
             // project this sample onto the sweep axis (gyro, mean-removed)
             s.sig = (s.gx - gMean[0]) * sweep[0] + (s.gy - gMean[1]) * sweep[1] + (s.gz - gMean[2]) * sweep[2]
 
-            return detect(s.t, s.sig)
+            // Pre-detection smoothing — the portal does this to "kill feather/noise
+            // wiggles" (detect.py). Without it, the sharp feather / hand-reversal spikes
+            // of a sculling stroke clear the threshold and get counted as extra catches.
+            // Causal moving average over ~SMOOTH_FRAC of a stroke period. The offset path
+            // keeps the RAW sig (the phase estimator wants the full oscillation).
+            val smoothMs = if (estPeriodMs > 0) (SMOOTH_FRAC * estPeriodMs).toLong().coerceAtLeast(1L)
+            else DEFAULT_SMOOTH_MS
+            val lo = s.t - smoothMs
+            var sum = 0.0; var cnt = 0
+            for (i in buf.indices.reversed()) {
+                val e = buf[i]
+                if (e.t < lo) break
+                sum += e.sig; cnt++
+            }
+            s.sigS = if (cnt > 0) sum / cnt else s.sig
+
+            return detect(s.t, s.sigS)
         }
 
         private fun recomputeAxisIfDue(now: Long) {
@@ -268,7 +302,7 @@ class StrokeAnalyzer {
             // running median + IQR, refreshed every STATS_REFRESH samples (they drift
             // slowly) instead of a full sort every sample.
             if (statsCountdown <= 0) {
-                val vals = DoubleArray(buf.size) { buf.elementAt(it).sig }
+                val vals = DoubleArray(buf.size) { buf.elementAt(it).sigS }
                 vals.sort()
                 val nn = vals.size
                 cMedian = if (nn % 2 == 1) vals[nn / 2] else (vals[nn / 2 - 1] + vals[nn / 2]) / 2.0
@@ -465,6 +499,15 @@ class StrokeAnalyzer {
     @Synchronized
     fun getLateness(mac: String): Long? = _lateness[mac]
 
+    /** Displayed stroke count for a seat — from the robust period, immune to the
+     *  feather/reversal spikes that make crossing-counting double up. */
+    @Synchronized
+    fun getStrokeCount(mac: String): Int = tracks[mac]?.strokeCount ?: 0
+
+    /** Displayed stroke rate (spm) for a seat — 60000 / robust period, 0 if not rowing. */
+    @Synchronized
+    fun getSpm(mac: String): Int = tracks[mac]?.spm ?: 0
+
     /**
      * Per-seat quality (shared with the portal): CALIBRATING until the axis + a first
      * paired offset exist; DEGRADED_SIGNAL if the sensor is held; OK if a recent
@@ -523,6 +566,7 @@ class StrokeAnalyzer {
         private const val REFRACTORY_FRAC = 0.55       // config.refractory_frac
         private const val HELD_RUN_FRAC = 0.30         // config.max_held_run_frac
         private const val XCORR_WINDOW_FRAC = 0.5      // config.xcorr_window_frac (half-window = this * period)
+        private const val SMOOTH_FRAC = 1.0 / 6.0      // config.smooth_frac (pre-detection smoothing window)
 
         // ─── PHONE-ONLY — real-time tier has no portal equivalent (the portal is batch). ──
         private const val WINDOW_MS = 20_000L          // trailing PCA/detection window
@@ -530,6 +574,7 @@ class StrokeAnalyzer {
         private const val AXIS_REFRESH_MS = 500L       // recompute the synthetic axis this often
         private const val MIN_WINDOW_FOR_MEDIAN = 10
         private const val STATS_REFRESH = 8            // recompute median/IQR every N samples
+        private const val DEFAULT_SMOOTH_MS = 150L     // smoothing window before a period is known
         private const val PERIOD_HZ = 25.0             // uniform grid for the autocorrelation period
         private const val AUTOCORR_MIN = 0.30          // min autocorrelation to accept a stroke period
         private const val HYST_FRAC = 0.20             // Schmitt band as a fraction of the IQR
