@@ -98,6 +98,25 @@ class StrokeAnalyzer {
         val periodMs: Long
             get() = if (prevCatchMs > 0 && lastCatchMs > prevCatchMs) lastCatchMs - prevCatchMs else 0L
 
+        // Recent catch times → a FALLBACK period (median inter-catch interval) used only
+        // when the autocorrelation can't lock (very erratic / feather-heavy motion). This
+        // is what keeps the app from going fully dark: catches are detected even when the
+        // spectral period isn't, so we can still show a rate/count and attempt an offset.
+        private val catchTimes = ArrayDeque<Long>()
+        fun recordCatch(t: Long) {
+            catchTimes.addLast(t)
+            while (catchTimes.size > CATCH_HISTORY) catchTimes.removeFirst()
+        }
+        fun catchPeriodMs(): Long {
+            if (catchTimes.size < 3) return 0L
+            val d = ArrayList<Double>(catchTimes.size - 1)
+            var prev = -1L
+            for (c in catchTimes) { if (prev > 0) d.add((c - prev).toDouble()); prev = c }
+            val med = median(d).toLong()
+            val loP = (1000.0 / BAND_HI).toLong(); val hiP = (1000.0 / BAND_LO).toLong()
+            return if (med in loP..hiP) med else 0L
+        }
+
         // Displayed stroke count/rate come from the ROBUST period (estPeriodMs), not from
         // counting spike-prone crossings: integrate rate over rowing time. domHz is
         // identical across seats and dead-on where catch counts disagree.
@@ -129,7 +148,7 @@ class StrokeAnalyzer {
             lastRawCrossMs = 0L; lastRawCrossUp = false; haveRawCross = false
             catchIsUp = null; gyroAfterUp = 0.0; nAfterUp = 0; gyroAfterDown = 0.0; nAfterDown = 0
             lookaheadUntil = 0L; lastCrossUp = false
-            lastCatchMs = 0L; prevCatchMs = 0L; catchCount = 0
+            lastCatchMs = 0L; prevCatchMs = 0L; catchCount = 0; catchTimes.clear()
             strokeAccum = 0.0; prevFreshT = 0L
             lastFreshMs = 0L; heldMs = 0L; degraded = false
         }
@@ -248,7 +267,10 @@ class StrokeAnalyzer {
                 sumSq += p * p
             }
             sweepEnergy = sqrt(sumSq / n)
-            estPeriodMs = chosenPeriod
+            // Autocorrelation is authoritative when it locks (prevents catch doubling);
+            // fall back to the median inter-catch interval only when it can't — so an
+            // erratic/feather-heavy seat still gets a period instead of going dark.
+            estPeriodMs = if (chosenPeriod > 0L) chosenPeriod else catchPeriodMs()
             domHz = if (estPeriodMs > 0) 1000.0 / estPeriodMs else 0.0
             axisReady = true
         }
@@ -363,6 +385,7 @@ class StrokeAnalyzer {
             if (lastCatchMs > 0 && crossMs - lastCatchMs < refractory) return null
 
             prevCatchMs = lastCatchMs; lastCatchMs = crossMs; catchCount++
+            recordCatch(crossMs)     // feed the fallback-period estimator
             return crossMs
         }
 
@@ -574,6 +597,7 @@ class StrokeAnalyzer {
         private const val AXIS_REFRESH_MS = 500L       // recompute the synthetic axis this often
         private const val MIN_WINDOW_FOR_MEDIAN = 10
         private const val STATS_REFRESH = 8            // recompute median/IQR every N samples
+        private const val CATCH_HISTORY = 7            // catches kept for the fallback median period
         private const val DEFAULT_SMOOTH_MS = 150L     // smoothing window before a period is known
         private const val PERIOD_HZ = 25.0             // uniform grid for the autocorrelation period
         private const val AUTOCORR_MIN = 0.30          // min autocorrelation to accept a stroke period
