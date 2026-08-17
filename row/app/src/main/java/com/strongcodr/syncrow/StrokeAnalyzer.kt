@@ -58,6 +58,7 @@ class StrokeAnalyzer {
         var axisReady = false
         var sweepEnergy = 0.0                    // std of projection (deg/s) — rowing gate
         var domHz = 0.0
+        var estPeriodMs = 0L      // robust stroke period (autocorrelation); 0 = none
         private var lastAxisMs = 0L
 
         // catch detection state (Schmitt on the projected signal)
@@ -159,14 +160,12 @@ class StrokeAnalyzer {
             val (evals, evecs) = jacobiEigenDesc(c)
             if (evals[0] <= EPS) return
 
-            // feather rejection: prefer PC1 if it oscillates in the stroke band, else PC2
+            // feather rejection: prefer PC1 if it has an in-band stroke period, else PC2
             val pc1 = doubleArrayOf(evecs[0][0], evecs[1][0], evecs[2][0])
             val pc2 = doubleArrayOf(evecs[0][1], evecs[1][1], evecs[2][1])
-            val f1 = axisFreq(gmx, gmy, gmz, pc1)
             var chosen = pc1
-            if (!inStrokeBand(f1)) {
-                val f2 = axisFreq(gmx, gmy, gmz, pc2)
-                if (inStrokeBand(f2)) chosen = pc2
+            if (periodOfAxis(gmx, gmy, gmz, pc1) == 0L) {
+                if (periodOfAxis(gmx, gmy, gmz, pc2) != 0L) chosen = pc2
             }
 
             // orthogonalise against gravity, normalise, deterministic sign
@@ -188,23 +187,49 @@ class StrokeAnalyzer {
                 sumSq += p * p
             }
             sweepEnergy = sqrt(sumSq / n)
-            domHz = axisFreq(gmx, gmy, gmz, sv)
+            estPeriodMs = periodOfAxis(gmx, gmy, gmz, sv)
+            domHz = if (estPeriodMs > 0) 1000.0 / estPeriodMs else 0.0
             axisReady = true
         }
 
-        /** Dominant frequency of the gyro projected on `axis`, via mean-crossing rate
-         *  over the buffer (a cheap, FFT-free stand-in for the portal's spectral peak). */
-        private fun axisFreq(gmx: Double, gmy: Double, gmz: Double, axis: DoubleArray): Double {
-            if (buf.size < 4) return 0.0
-            var prev = Double.NaN; var crossings = 0
-            for (s in buf) {
-                val p = (s.gx - gmx) * axis[0] + (s.gy - gmy) * axis[1] + (s.gz - gmz) * axis[2]
-                if (!prev.isNaN() && ((prev <= 0 && p > 0) || (prev > 0 && p <= 0))) crossings++
-                prev = p
+        /** Stroke period (ms) of the gyro projected on `axis`, via AUTOCORRELATION —
+         *  the FFT-free equivalent of the portal's spectral peak. Robust to harmonics
+         *  and noise (crossing-counting is not: it locks onto the 2× harmonic and reads
+         *  0.44 Hz as ~0.9 Hz). Projects onto the axis, resamples to a uniform grid,
+         *  and returns the lag of the strongest autocorrelation peak within the stroke
+         *  band. 0 if there is no clear in-band periodicity. */
+        private fun periodOfAxis(gmx: Double, gmy: Double, gmz: Double, axis: DoubleArray): Long {
+            val arr = buf.toList()
+            if (arr.size < 16) return 0
+            val t0 = arr.first().t; val t1 = arr.last().t
+            if (t1 - t0 < 3000) return 0                 // need a few seconds
+            val m = ((t1 - t0) / 1000.0 * PERIOD_HZ).toInt()
+            if (m < 32) return 0
+            val x = DoubleArray(m)
+            var j = 0
+            for (i in 0 until m) {
+                val tt = t0 + i * 1000.0 / PERIOD_HZ
+                while (j < arr.size - 1 && arr[j + 1].t < tt) j++
+                val a = arr[j]; val b = arr[if (j + 1 < arr.size) j + 1 else j]
+                val pa = (a.gx - gmx) * axis[0] + (a.gy - gmy) * axis[1] + (a.gz - gmz) * axis[2]
+                val pb = (b.gx - gmx) * axis[0] + (b.gy - gmy) * axis[1] + (b.gz - gmz) * axis[2]
+                x[i] = if (b.t == a.t) pa else pa + (tt - a.t) / (b.t - a.t) * (pb - pa)
             }
-            val durS = (buf.last().t - buf.first().t) / 1000.0
-            if (durS <= 0) return 0.0
-            return crossings / (2.0 * durS)   // two mean-crossings per cycle
+            var mean = 0.0; for (v in x) mean += v; mean /= m
+            for (i in x.indices) x[i] -= mean
+            var zero = 0.0; for (v in x) zero += v * v
+            if (zero < EPS) return 0
+            val minLag = (PERIOD_HZ / BAND_HI).toInt()
+            val maxLag = minOf((PERIOD_HZ / BAND_LO).toInt(), m - 1)
+            var bestLag = -1; var best = 0.0
+            for (lag in minLag..maxLag) {
+                var s = 0.0
+                for (i in 0 until m - lag) s += x[i] * x[i + lag]
+                val cc = s / zero
+                if (cc > best) { best = cc; bestLag = lag }
+            }
+            if (bestLag < 0 || best < AUTOCORR_MIN) return 0
+            return (bestLag * 1000.0 / PERIOD_HZ).toLong()
         }
 
         /** Median-crossing catch detection on the projected signal. Same structure as
@@ -264,7 +289,10 @@ class StrokeAnalyzer {
             val isCatch = if (catchIsUp == true) crossUp else !crossUp
             if (!isCatch) return null
 
-            val refractory = if (periodMs > 0) maxL(REFRACTORY_FLOOR_MS, (periodMs * REFRACTORY_FRAC).toLong())
+            // refractory from the ROBUST (autocorrelation) period, not the catch-to-catch
+            // interval — bootstrapping from possibly-doubled catches would keep doubling.
+            val basePeriod = if (estPeriodMs > 0) estPeriodMs else periodMs
+            val refractory = if (basePeriod > 0) maxL(REFRACTORY_FLOOR_MS, (basePeriod * REFRACTORY_FRAC).toLong())
             else REFRACTORY_FLOOR_MS
             if (lastCatchMs > 0 && crossMs - lastCatchMs < refractory) return null
 
@@ -303,6 +331,7 @@ class StrokeAnalyzer {
     private val _lateness = HashMap<String, Long>()
     private val _latenessUpdatedMs = HashMap<String, Long>()
     private val _corr = HashMap<String, Double>()
+    private val _recent = HashMap<String, ArrayDeque<Double>>()  // recent offsets for a stable median
     private var lastSampleMs = 0L
 
     /** Reference catches awaiting their forward half-window before offsets compute. */
@@ -336,7 +365,7 @@ class StrokeAnalyzer {
 
         if (!fresh) {
             track.markHeld(timeMs)
-            if (track.degraded) { _lateness.remove(mac); _latenessUpdatedMs.remove(mac) }
+            if (track.degraded) { _lateness.remove(mac); _latenessUpdatedMs.remove(mac); _recent.remove(mac) }
             drainPending()
             return null
         }
@@ -345,10 +374,10 @@ class StrokeAnalyzer {
             Sample(timeMs, ax.toDouble(), ay.toDouble(), az.toDouble(),
                 wx.toDouble(), wy.toDouble(), wz.toDouble())
         )
-        if (track.degraded) { _lateness.remove(mac); _latenessUpdatedMs.remove(mac) }
+        if (track.degraded) { _lateness.remove(mac); _latenessUpdatedMs.remove(mac); _recent.remove(mac) }
 
         if (catch != null && mac == referenceMac && isRowing(track)) {
-            val period = track.periodMs
+            val period = if (track.estPeriodMs > 0) track.estPeriodMs else track.periodMs
             if (period in 600..6000) pending.addLast(Pending(catch, (period * XCORR_WINDOW_FRAC).toLong()))
         }
         drainPending()
@@ -381,9 +410,17 @@ class StrokeAnalyzer {
                 val est = gaussianLag(refWin, win, XCORR_GRID_HZ, p.halfMs * XCORR_MAXLAG_FRAC / 1000.0)
                     ?: continue
                 _corr[mac] = est.rho
-                _lateness[mac] = Math.round(est.lagS * 1000.0)
                 _latenessUpdatedMs[mac] = p.tRef
-                offsets.add(est.lagS * 1000.0)
+                val offMs = est.lagS * 1000.0
+                offsets.add(offMs)
+                // display a MEDIAN of recent trustworthy strokes (like the portal) so one
+                // weak-match stroke can't flick the number to a wild value.
+                if (est.rho >= MIN_CORR) {
+                    val ring = _recent.getOrPut(mac) { ArrayDeque() }
+                    ring.addLast(offMs)
+                    while (ring.size > RECENT_STROKES) ring.removeFirst()
+                    _lateness[mac] = Math.round(median(ring))
+                }
             }
         }
     }
@@ -411,16 +448,25 @@ class StrokeAnalyzer {
     @Synchronized
     fun isCalibrated(mac: String): Boolean = tracks[mac]?.axisReady == true
 
+    /** Internal state, for diagnostics/replay. */
+    @Synchronized
+    fun debugState(mac: String): String {
+        val t = tracks[mac] ?: return "no track"
+        return "axis=${t.axisReady} sweepE=${"%.1f".format(t.sweepEnergy)} domHz=${"%.3f".format(t.domHz)} " +
+            "catches=${t.catchCount} rowing=${isRowing(t)} buf=${t.buf.size} " +
+            "ref=${mac == referenceMac} pending=${pending.size} corr=${_corr[mac]?.let { "%.2f".format(it) } ?: "-"}"
+    }
+
     @Synchronized
     fun reset() {
         tracks.values.forEach { it.reset() }
-        _lateness.clear(); _latenessUpdatedMs.clear(); _corr.clear(); pending.clear(); lastSampleMs = 0L
+        _lateness.clear(); _latenessUpdatedMs.clear(); _corr.clear(); _recent.clear(); pending.clear(); lastSampleMs = 0L
     }
 
     @Synchronized
     fun clear() {
         tracks.clear(); macToSeat.clear(); referenceMac = null
-        _lateness.clear(); _latenessUpdatedMs.clear(); _corr.clear(); pending.clear(); lastSampleMs = 0L
+        _lateness.clear(); _latenessUpdatedMs.clear(); _corr.clear(); _recent.clear(); pending.clear(); lastSampleMs = 0L
     }
 
     private fun isRowing(t: Track): Boolean =
@@ -438,6 +484,8 @@ class StrokeAnalyzer {
         private const val MIN_SAMPLES = 30
         private const val AXIS_REFRESH_MS = 500L
         private const val MIN_WINDOW_FOR_MEDIAN = 10
+        private const val PERIOD_HZ = 25.0          // uniform grid for the autocorrelation period
+        private const val AUTOCORR_MIN = 0.30       // min autocorrelation to accept a stroke period
         private const val HYST_FRAC = 0.20
         private const val REFRACTORY_FRAC = 0.55
         private const val REFRACTORY_FLOOR_MS = 500L
@@ -452,6 +500,7 @@ class StrokeAnalyzer {
         private const val XCORR_MAXLAG_FRAC = 0.60     // max searched lag as frac of half-window
         private const val XCORR_MARGIN_MS = 120L       // wait a touch past the window edge
         private const val MIN_CORR = 0.5
+        private const val RECENT_STROKES = 7        // median window for the displayed lateness
 
         // stroke validity (shared spec)
         private const val BAND_LO = 0.2
@@ -463,6 +512,11 @@ class StrokeAnalyzer {
 
         private fun inStrokeBand(hz: Double) = hz in BAND_LO..BAND_HI
         private fun maxL(a: Long, b: Long) = if (a > b) a else b
+
+        fun median(xs: Collection<Double>): Double {
+            val s = xs.sorted(); val n = s.size
+            return when { n == 0 -> 0.0; n % 2 == 1 -> s[n / 2]; else -> (s[n / 2 - 1] + s[n / 2]) / 2.0 }
+        }
 
         /** Zero-lag correlation sign between two windows (mean-removed). < 0 = anti-phase. */
         fun signOfCorr(a: DoubleArray, b: DoubleArray): Double {

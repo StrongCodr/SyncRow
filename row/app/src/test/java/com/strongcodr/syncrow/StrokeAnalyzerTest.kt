@@ -40,6 +40,7 @@ class StrokeAnalyzerTest {
         offsetsS: Map<String, Double>, axes: Map<String, DoubleArray>,
         grav: Map<String, DoubleArray>, seat: Map<String, Int>,
         durMs: Long, driveBias: Boolean = true, noise: Double = 0.6, seed: Long = 1,
+        harmonic: Double = 0.0,
     ): StrokeAnalyzer {
         val a = StrokeAnalyzer()
         for ((name, idx) in seat) a.addSensor(name, idx)
@@ -50,8 +51,10 @@ class StrokeAnalyzerTest {
             for ((name, off) in offsetsS) {
                 val th = 2 * PI * strokeHz * ((t - off * 1000.0) / 1000.0)
                 // sweep angular velocity; drive half (sin>0) boosted so catch phase locks,
-                // like real rowing (drive faster than recovery).
-                var s = amp * sin(th)
+                // like real rowing (drive faster than recovery). `harmonic` adds a 2x
+                // component (extra mean-crossings) to mimic real data that fooled the old
+                // crossing-rate frequency estimate.
+                var s = amp * (sin(th) + harmonic * sin(2 * th))
                 if (driveBias && s > 0) s *= 1.8
                 val ax = unit(axes[name]!!)
                 val gx = s * ax[0] + rng.nextGaussian() * noise
@@ -119,6 +122,28 @@ class StrokeAnalyzerTest {
             if (abs(want) > 20) assertTrue("$name wrong sign: $got vs $want",
                 (got > 0) == (want > 0))
         }
+    }
+
+    // ─── harmonic-rich signal must still be recognised as rowing (regression) ───
+
+    @Test
+    fun `strong 2x harmonic still recovers offset (autocorrelation period)`() {
+        // A signal with a big 2nd harmonic has ~2x the mean-crossings — the old
+        // crossing-rate estimate read this as out-of-band and never computed offsets.
+        // Autocorrelation locks the true fundamental, so rowing is recognised.
+        val a = runCrew(
+            offsetsS = mapOf("s1" to 0.04, "s2" to 0.0),
+            axes = mapOf("s1" to doubleArrayOf(0.3, 0.8, 0.5), "s2" to doubleArrayOf(-0.6, 0.2, 0.75)),
+            grav = mapOf("s1" to doubleArrayOf(0.0, 0.1, 1.0), "s2" to doubleArrayOf(0.1, 0.0, 1.0)),
+            seat = mapOf("s1" to 1, "s2" to 2),
+            durMs = 45_000L, harmonic = 0.35,
+        )
+        // the real bug: harmonic content made the old estimate read out-of-band, so it
+        // never recognised rowing and never produced an offset. Guard that it now does.
+        assertEquals(SensorSyncStatus.OK, a.getStatus("s2"))
+        val lat = a.getLateness("s1")
+        assertTrue("no offset computed for harmonic-rich signal", lat != null)
+        assertTrue("s1: got ${lat}ms, want ~40ms", abs(lat!! - 40) < 25)
     }
 
     // ─── math unit checks ───────────────────────────────────────────────────────
