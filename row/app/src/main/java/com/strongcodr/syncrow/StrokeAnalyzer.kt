@@ -1,11 +1,8 @@
 package com.strongcodr.syncrow
 
 import com.strongcodr.syncrow.model.SensorSyncStatus
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
+import kotlin.math.ln
 import kotlin.math.sqrt
 
 /**
@@ -17,17 +14,22 @@ import kotlin.math.sqrt
  *      against gravity, deterministic sign. Gyro projected onto `sweep` = a signed
  *      1-D stroke signal — INDEPENDENT of how the sensor is mounted on the oar.
  *   2. Catch detection: running-median crossing + Schmitt hysteresis + refractory.
- *   3. Cross-sensor offset: per reference stroke, the difference in FUNDAMENTAL PHASE
- *      of the sign-aligned projected signals (a single-bin DFT at the stroke rate).
- *      Harmonic-immune — a plain cross-correlation locks onto the wrong peak when the
- *      gyro waveform is harmonic-rich (which real rowing is).
+ *   3. Cross-sensor offset: per reference stroke, the NORMALIZED CROSS-CORRELATION of
+ *      the sign-aligned projected signals over a one-stroke window (portal's
+ *      `crosssensor.gaussian_lag`). One estimator yields BOTH the signed offset (the
+ *      correlation peak lag) AND the confidence (rho = the peak's normalized height, a
+ *      shape match). A real stroke is a spiky, harmonic-rich wave — only ~14% of its
+ *      energy is the fundamental — so rho (whole-shape match) stays high where a "how
+ *      sinusoidal is it" score would not; that shape match is what gates the display.
  *
  * Reference = the STROKE seat = HIGHEST seat number; it reads 0, everyone else is
  * measured against it.
  *
  * REAL-TIME ADJUSTMENTS vs the batch portal (kept minimal, non-material):
- *   - PCA runs over a trailing WINDOW_MS window, not the whole piece. The stroke
- *     axis is ~constant over a piece, so the axis is the same.
+ *   - The synthetic axis is recomputed over a TRAILING WINDOW_MS window every
+ *     AXIS_REFRESH_MS (the portal does the same over a trailing window at anchor
+ *     points). So a mid-piece sensor re-orientation re-locks the axis on BOTH tiers,
+ *     instead of one whole-piece PCA blending two mountings.
  *   - Each reference stroke's offset uses a window CENTRED on the catch (half a
  *     stroke either side), identical to the portal — but we must wait until that
  *     forward half has arrived, so a stroke's offset appears ~half a stroke (~1.2s)
@@ -35,6 +37,12 @@ import kotlin.math.sqrt
  *     the final ~1 stroke of a piece never gets its forward half, so it's absent from
  *     the running median — invisible on a live display, accepted; the portal recompute
  *     is authoritative for the full piece.)
+ *   - The DISPLAYED lateness is the median of the last RECENT_STROKES offsets (a stable
+ *     live number); the portal medians ALL piece strokes for its authoritative chart.
+ *     On a clean piece the two agree (validated: run30 same-hand => phone 0 ms / portal
+ *     -2 ms); on a noisy few-stroke session they can differ, because a median of noisy
+ *     per-stroke offsets is itself noisy — not algorithm drift (the estimator is byte-
+ *     identical to the portal's gaussian_lag).
  *
  * Validated against synthetic ground truth (StrokeAnalyzerTest) the same way the
  * portal is: inject known per-seat offsets through arbitrary mountings, recover them.
@@ -477,30 +485,25 @@ class StrokeAnalyzer {
             pending.removeFirst()
 
             val t0 = p.tRef - p.halfMs; val t1 = p.tRef + p.halfMs
-            val f0 = 1000.0 / (2.0 * p.halfMs)                 // fundamental Hz (period = 2*half)
+            val period = 2.0 * p.halfMs                          // window spans one stroke period
+            val maxLagS = XCORR_MAX_LAG_FRAC * period / 1000.0   // cap the lag search (portal parity)
             val refWin = refTrack.resample(t0, t1, XCORR_GRID_HZ) ?: continue
-            val refPhase = fundamentalPhase(refWin, f0, XCORR_GRID_HZ) ?: continue
             _lateness[ref] = 0L; _latenessUpdatedMs[ref] = p.tRef; _corr[ref] = 1.0
 
             for ((mac, track) in tracks) {
                 if (mac == ref || !isRowing(track)) continue
                 var win = track.resample(t0, t1, XCORR_GRID_HZ) ?: continue
                 // Sign-align first: an arbitrarily-mounted sensor's synthetic axis may be
-                // anti-phase to the stroke's, which would shift the fundamental phase by
-                // pi (a half-period offset error). Flip via the zero-lag correlation sign.
+                // anti-phase to the stroke's (mirrors the portal's align_signs). Without
+                // this the cross-correlation could lock a half-period away.
                 if (signOfCorr(refWin, win) < 0) win = DoubleArray(win.size) { -win[it] }
-                val seatPhase = fundamentalPhase(win, f0, XCORR_GRID_HZ) ?: continue
-                // Offset from the FUNDAMENTAL phase difference — harmonic-immune. A strong
-                // 2x harmonic makes the raw waveform double-peaked and lets a plain x-corr
-                // lock onto the wrong peak (a confident-but-wrong lag); the fundamental
-                // phase ignores harmonics entirely. Phase wraps at one period, so a real
-                // (sub-period) crew offset is unambiguous.
-                var dphi = seatPhase.phase - refPhase.phase
-                while (dphi > PI) dphi -= 2.0 * PI
-                while (dphi < -PI) dphi += 2.0 * PI
-                val offMs = dphi / (2.0 * PI * f0) * 1000.0
-                // confidence = how well each window is a clean fundamental oscillation
-                val rho = minOf(refPhase.coherence, seatPhase.coherence)
+                // Offset AND confidence from ONE estimator (portal's gaussian_lag): the
+                // normalized cross-correlation of the two shape signals. The peak lag is
+                // the signed offset; rho (peak height) is the whole-shape match — high for
+                // real spiky strokes, unlike a "how sinusoidal" score.
+                val est = crossLag(refWin, win, XCORR_GRID_HZ, maxLagS) ?: continue
+                val offMs = est.lagMs
+                val rho = est.rho
                 _corr[mac] = rho
                 _latenessUpdatedMs[mac] = p.tRef
                 if (rho >= MIN_CORR) {
@@ -583,10 +586,11 @@ class StrokeAnalyzer {
         private const val REFRACTORY_FRAC = 0.55       // config.refractory_frac
         private const val HELD_RUN_FRAC = 0.30         // config.max_held_run_frac
         private const val XCORR_WINDOW_FRAC = 0.5      // config.xcorr_window_frac (half-window = this * period)
+        private const val XCORR_MAX_LAG_FRAC = 0.30    // config.xcorr_max_lag_frac (cap the lag search)
         private const val SMOOTH_FRAC = 1.0 / 6.0      // config.smooth_frac (pre-detection smoothing window)
 
         // ─── PHONE-ONLY — real-time tier has no portal equivalent (the portal is batch). ──
-        private const val WINDOW_MS = 20_000L          // trailing PCA/detection window
+        private const val WINDOW_MS = 10_000L          // trailing PCA/detection window (portal axis window matches)
         private const val MIN_SAMPLES = 30             // min fresh samples before an axis
         private const val AXIS_REFRESH_MS = 500L       // recompute the synthetic axis this often
         private const val MIN_WINDOW_FOR_MEDIAN = 10
@@ -600,11 +604,10 @@ class StrokeAnalyzer {
         private const val GYRO_LOOKAHEAD_MS = 300L
         private const val MIN_GYRO_SAMPLES = 6
         private const val HELD_FLOOR_MS = 500L
-        private const val XCORR_GRID_HZ = 100.0        // resample grid for the phase estimate
+        private const val XCORR_GRID_HZ = 100.0        // resample grid for the cross-correlation
         private const val XCORR_MARGIN_MS = 120L       // wait a touch past the window edge
-        // NOTE: the phone gates on fundamental COHERENCE (energy fraction in f0), which is
-        // analogous to but NOT the same quantity as the portal's x-corr rho (config.min_corr).
-        // Phone-tuned; do not assume it must equal the portal value.
+        // Shape-match gate: the same normalized cross-correlation rho the portal uses
+        // (config.min_corr). Below this the waveforms don't line up -> LOW_CONF, no offset.
         private const val MIN_CORR = 0.5
         private const val RECENT_STROKES = 7           // median window for the displayed lateness
         private const val STALE_WINDOW_MS = 6000L      // no paired offset within this -> STALE
@@ -612,29 +615,60 @@ class StrokeAnalyzer {
         private fun inStrokeBand(hz: Double) = hz in BAND_LO..BAND_HI
         private fun maxL(a: Long, b: Long) = if (a > b) a else b
 
-        class Phase(val phase: Double, val coherence: Double)
+        /** Result of the cross-correlation offset estimator (mirrors the portal's
+         *  crosssensor.LagEst). `lagMs` POSITIVE => `other` is LATER than `ref`. */
+        class LagEst(val lagMs: Double, val rho: Double, val n: Int)
 
-        /** Fundamental phase of `x` (sampled at `hz`) at frequency `f0`, via a single-bin
-         *  DFT (Goertzel-style). `coherence` is the share of the signal that IS that
-         *  fundamental (amplitude/RMS, 0..1) — the confidence that this window is a clean
-         *  stroke oscillation. Harmonic content contributes to RMS but not to the f0 bin,
-         *  so a harmonic-rich signal has a well-defined fundamental phase and lower
-         *  coherence — exactly what we want. */
-        fun fundamentalPhase(x: DoubleArray, f0: Double, hz: Double): Phase? {
-            val n = x.size
-            if (n < 8 || f0 <= 0) return null
-            var mean = 0.0; for (v in x) mean += v; mean /= n
-            var re = 0.0; var im = 0.0; var ss = 0.0
-            for (k in 0 until n) {
-                val ang = 2.0 * PI * f0 * k / hz
-                val v = x[k] - mean
-                re += v * cos(ang); im += v * sin(ang); ss += v * v
+        /** Sub-sample lag of `other` vs `ref` by cross-correlation with log-parabolic
+         *  ("Gaussian") peak interpolation, plus the normalized peak correlation rho (the
+         *  match confidence). SHARED SPEC — mirrors the portal's crosssensor.gaussian_lag;
+         *  keep the two in step.
+         *
+         *  Convention: POSITIVE lag => `other` lags (is LATER than) `ref`.
+         *  The offset is argmax over the raw correlation (unbiased by window edges — a
+         *  constant scale never moves the peak). rho is the Pearson correlation AT the peak
+         *  lag, computed over the OVERLAPPING region only (per-lag normalization), so it
+         *  stays honest at large lags where one whole-window norm would understate it.
+         *
+         *  Known, accepted, SHARED with the portal: the log-parabolic sub-sample step is
+         *  slightly CONSERVATIVE on the asymmetric (fast-drive/slow-recovery) stroke peak —
+         *  it pulls large offsets a few % toward zero (e.g. an injected 50 ms reads ~42).
+         *  The integer-grid peak is unbiased; interpolation trades a little magnitude for
+         *  sub-10 ms resolution. Both tiers run the identical step, so they never disagree. */
+        fun crossLag(ref: DoubleArray, other: DoubleArray, hz: Double, maxLagS: Double): LagEst? {
+            val n = minOf(ref.size, other.size)
+            if (n < 8 || hz <= 0.0) return null
+            var ma = 0.0; var mb = 0.0
+            for (i in 0 until n) { ma += ref[i]; mb += other[i] }
+            ma /= n; mb /= n
+            val a = DoubleArray(n) { ref[it] - ma }
+            val b = DoubleArray(n) { other[it] - mb }
+            val maxLag = (maxLagS * hz).toInt().coerceIn(1, n - 1)
+            // corr[lag] = Σ_k b[k]·a[k-lag]  (== np.correlate(b, a, "full")); +lag => other later.
+            var bestLag = 0; var bestC = Double.NEGATIVE_INFINITY
+            val c = HashMap<Int, Double>(2 * maxLag + 1)
+            for (lag in -maxLag..maxLag) {
+                var s = 0.0
+                for (k in 0 until n) { val j = k - lag; if (j in 0 until n) s += b[k] * a[j] }
+                c[lag] = s
+                if (s > bestC) { bestC = s; bestLag = lag }
             }
-            if (ss < EPS) return null
-            val amp = 2.0 * sqrt(re * re + im * im) / n            // fundamental amplitude
-            val rms = sqrt(ss / n)
-            val coh = (amp / (rms * sqrt(2.0))).coerceIn(0.0, 1.0) // 1 for a pure sinusoid
-            return Phase(atan2(im, re), coh)
+            // rho = normalized peak correlation over the peak lag's OVERLAP only.
+            var num = 0.0; var sa = 0.0; var sb = 0.0
+            for (k in 0 until n) {
+                val j = k - bestLag
+                if (j in 0 until n) { num += b[k] * a[j]; sa += a[j] * a[j]; sb += b[k] * b[k] }
+            }
+            val rho = if (sa > EPS && sb > EPS) num / sqrt(sa * sb) else 0.0
+            // log-parabolic sub-sample peak (valid only where the three points are positive)
+            var lag = bestLag.toDouble()
+            val ym1 = c[bestLag - 1]; val y0 = c[bestLag]; val yp1 = c[bestLag + 1]
+            if (ym1 != null && y0 != null && yp1 != null && ym1 > 0.0 && y0 > 0.0 && yp1 > 0.0) {
+                val l1 = ln(ym1); val l0 = ln(y0); val l2 = ln(yp1)
+                val d = l1 - 2.0 * l0 + l2
+                if (d != 0.0) lag = bestLag + 0.5 * (l1 - l2) / d
+            }
+            return LagEst(lag / hz * 1000.0, rho, n)
         }
 
         fun median(xs: Collection<Double>): Double {

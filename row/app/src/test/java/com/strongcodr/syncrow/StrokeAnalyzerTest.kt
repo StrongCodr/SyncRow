@@ -149,19 +149,16 @@ class StrokeAnalyzerTest {
     // ─── math unit checks ───────────────────────────────────────────────────────
 
     @Test
-    fun `fundamentalPhase offset sign - later signal is positive`() {
+    fun `crossLag sign and magnitude - later signal is positive`() {
+        // Cross-correlation offset convention + accuracy on a clean pair: a signal
+        // delayed 5 samples (50 ms at 100 Hz) must read +50 ms, rho ~1 (perfect match).
         val hz = 100.0; val f0 = 0.5; val n = 400
         val ref = DoubleArray(n) { sin(2 * PI * f0 * it / hz) }
         val later = DoubleArray(n) { sin(2 * PI * f0 * (it - 5) / hz) } // delayed 5 samples = 50ms
-        val pr = StrokeAnalyzer.fundamentalPhase(ref, f0, hz)!!
-        val pl = StrokeAnalyzer.fundamentalPhase(later, f0, hz)!!
-        var dphi = pl.phase - pr.phase
-        while (dphi > PI) dphi -= 2 * PI
-        while (dphi < -PI) dphi += 2 * PI
-        val offMs = dphi / (2 * PI * f0) * 1000.0
-        assertTrue("later signal => +offset, got $offMs", offMs > 0)
-        assertEquals(50.0, offMs, 5.0)
-        assertTrue("clean sinusoid => coherence ~1", pr.coherence > 0.9)
+        val est = StrokeAnalyzer.crossLag(ref, later, hz, 0.6)!!
+        assertTrue("later signal => +offset, got ${est.lagMs}", est.lagMs > 0)
+        assertEquals(50.0, est.lagMs, 5.0)
+        assertTrue("identical shape => rho ~1, got ${est.rho}", est.rho > 0.95)
     }
 
     @Test
