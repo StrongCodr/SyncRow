@@ -161,6 +161,70 @@ class StrokeAnalyzerTest {
         assertTrue("identical shape => rho ~1, got ${est.rho}", est.rho > 0.95)
     }
 
+    // ─── adaptive axis re-locks after a mid-session re-orientation ──────────────
+
+    private fun feedOne(
+        a: StrokeAnalyzer, name: String, t: Long, s: Double,
+        axis: DoubleArray, grav: DoubleArray, rng: Random,
+    ) {
+        val ax = unit(axis); val g = unit(grav)
+        a.onSample(
+            name, t, true,
+            (g[0] + rng.nextGaussian() * 0.01).toFloat(),
+            (g[1] + rng.nextGaussian() * 0.01).toFloat(),
+            (g[2] + rng.nextGaussian() * 0.01).toFloat(),
+            (s * ax[0] + rng.nextGaussian() * 0.6).toFloat(),
+            (s * ax[1] + rng.nextGaussian() * 0.6).toFloat(),
+            (s * ax[2] + rng.nextGaussian() * 0.6).toFloat(),
+        )
+    }
+
+    @Test
+    fun `adaptive axis re-locks after a mid-session re-orientation`() {
+        // s1 is bumped at the midpoint: its stroke axis AND gravity change. The trailing-
+        // window axis must re-lock so the LATE strokes still read ~0 ms (both sensors move
+        // in sync throughout) — a whole-interval axis would blend the two mounts. Mirrors
+        // the portal's test_adaptive_axis_relocks_after_reorientation.
+        val a = StrokeAnalyzer()
+        a.addSensor("s1", 1); a.addSensor("s2", 2)   // s2 = stroke reference
+        val rng = Random(9)
+        val axRef = doubleArrayOf(0.2, 0.9, -0.3); val gRef = doubleArrayOf(0.0, 0.1, 1.0)
+        val ax1 = doubleArrayOf(0.9, 0.1, 0.2); val ax2 = doubleArrayOf(0.1, 0.9, 0.2)
+        val g1 = doubleArrayOf(0.05, -0.1, 1.0); val g2 = doubleArrayOf(0.6, 0.1, 0.8)
+        var t = 1_000_000L
+        val dur = 80_000L; val end = t + dur; val mid = t + dur / 2
+        while (t < end) {
+            val th = 2 * PI * strokeHz * (t / 1000.0)
+            var s = amp * sin(th); if (s > 0) s *= 1.8
+            feedOne(a, "s2", t, s, axRef, gRef, rng)
+            feedOne(a, "s1", t, s, if (t < mid) ax1 else ax2, if (t < mid) g1 else g2, rng)
+            t += dtMs
+        }
+        val lat = a.getLateness("s1")
+        assertTrue("no reading after re-orientation", lat != null)
+        assertTrue("re-lock failed: s1 late offset ${lat}ms (want ~0)", abs(lat!!) <= 20)
+    }
+
+    // ─── golden vector: crossLag must match the portal's gaussian_lag byte-for-byte ─
+
+    @Test
+    fun `crossLag matches portal golden vector`() {
+        // Same FIXED deterministic input as the portal's test_golden_vector_matches_phone;
+        // the expected constants are identical on both sides, so any drift breaks one test.
+        // The magnitudes also PIN the conservative sub-sample bias (a +40 ms shift -> ~34.5).
+        val fs = 100.0; val f = 0.5; val n = 200
+        fun wave(shift: Int) = DoubleArray(n) {
+            val x = sin(2 * PI * f * (it - shift) / fs); if (x > 0) 1.8 * x else x
+        }
+        val ref = wave(0)
+        val golden = listOf(Triple(0, 0.0, 1.0), Triple(4, 34.52485, 0.99948), Triple(-7, -67.92291, 1.0))
+        for ((shift, lagMs, rho) in golden) {
+            val est = StrokeAnalyzer.crossLag(ref, wave(shift), fs, 0.2)!!
+            assertEquals("lag shift=$shift", lagMs, est.lagMs, 0.02)
+            assertEquals("rho shift=$shift", rho, est.rho, 0.001)
+        }
+    }
+
     @Test
     fun `jacobi recovers a known dominant axis`() {
         // covariance dominated by direction d

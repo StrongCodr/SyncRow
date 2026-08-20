@@ -229,16 +229,30 @@ class StrokeAnalyzer {
             val (evals, evecs) = jacobiEigenDesc(c)
             if (evals[0] <= EPS) return
 
-            // feather rejection: prefer PC1 if it has an in-band stroke period, else PC2.
+            // feather choice, with HYSTERESIS (matches the portal _axis): once an axis is
+            // locked, keep following whichever PC CONTINUES it (the one most aligned with
+            // the previous sweep) while it still has an in-band period — only re-decide
+            // fresh when the continuation leaves the band (a real re-orientation). Without
+            // this, a window where PC1 is marginally out-of-band flips to PC2 (a ~90° jump
+            // the sign-continuity below can't fix), corrupting the projected signal.
             // Compute the chosen axis's period ONCE and reuse it (sweep ≈ chosen after
             // orthogonalisation, so its period is the same) — avoids a 3rd periodOfAxis.
             val pc1 = doubleArrayOf(evecs[0][0], evecs[1][0], evecs[2][0])
             val pc2 = doubleArrayOf(evecs[0][1], evecs[1][1], evecs[2][1])
             var chosen = pc1
-            var chosenPeriod = periodOfAxis(gmx, gmy, gmz, pc1)
-            if (chosenPeriod == 0L) {
-                val p2 = periodOfAxis(gmx, gmy, gmz, pc2)
-                if (p2 != 0L) { chosen = pc2; chosenPeriod = p2 }
+            var chosenPeriod = 0L
+            if (axisReady) {
+                val cont = if (dotAbs(pc1, sweep) >= dotAbs(pc2, sweep)) pc1 else pc2
+                val pc = periodOfAxis(gmx, gmy, gmz, cont)
+                if (pc != 0L) { chosen = cont; chosenPeriod = pc }
+            }
+            if (chosenPeriod == 0L) {                        // fresh: no lock, or continuation left the band
+                chosen = pc1
+                chosenPeriod = periodOfAxis(gmx, gmy, gmz, pc1)
+                if (chosenPeriod == 0L) {
+                    val p2 = periodOfAxis(gmx, gmy, gmz, pc2)
+                    if (p2 != 0L) { chosen = pc2; chosenPeriod = p2 }
+                }
             }
 
             // orthogonalise against gravity, normalise
@@ -614,6 +628,11 @@ class StrokeAnalyzer {
 
         private fun inStrokeBand(hz: Double) = hz in BAND_LO..BAND_HI
         private fun maxL(a: Long, b: Long) = if (a > b) a else b
+
+        /** |cosine| alignment between two 3-vectors — used to pick the PC that continues
+         *  the previously-tracked axis (feather hysteresis). Sign-independent. */
+        private fun dotAbs(a: DoubleArray, b: DoubleArray) =
+            abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2])
 
         /** Result of the cross-correlation offset estimator (mirrors the portal's
          *  crosssensor.LagEst). `lagMs` POSITIVE => `other` is LATER than `ref`. */
