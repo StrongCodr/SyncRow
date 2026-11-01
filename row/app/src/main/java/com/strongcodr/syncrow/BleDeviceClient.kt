@@ -86,9 +86,9 @@ class BleDeviceClient(private val context: Context) {
         // WIT protocol config frames: 5-byte [FF AA <reg> <lo> <hi>]
         private val CMD_UNLOCK = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x69.toByte(), 0x88.toByte(), 0xB5.toByte())
         private val CMD_SAVE   = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())
-        private fun cmdSetRate(rrate: Int) = byteArrayOf(
-            0xFF.toByte(), 0xAA.toByte(), 0x03.toByte(), rrate.toByte(), 0x00.toByte()
-        )
+        // The output rate (RRATE register 0x03) is deliberately NOT written: the app sets no
+        // expectation on the unit's rate. Whatever the unit is configured to send (1–200 Hz)
+        // is recorded as it arrives; the diagnostics report the observed rate.
 
         // RSW (Output Selection) register bitmask. On the BLE 5.0 firmware family, the
         // 0x61 combined packet streams automatically regardless of RSW. Bit 0 controls the
@@ -101,36 +101,12 @@ class BleDeviceClient(private val context: Context) {
         private const val RSW_TIME_BIT = 0x0001
         private const val RSW_OFF      = 0x0000
 
-        // RRATE register values (0x03). See wit_sensor_protocol memory.
-        const val RRATE_10HZ  = 0x06
-        const val RRATE_20HZ  = 0x07
-        const val RRATE_50HZ  = 0x08
-        const val RRATE_100HZ = 0x09
-        const val RRATE_200HZ = 0x0B
-
-        // App-wide target ODR. Mutable so the recording path can raise/lower without rebuilding.
-        // Default is 50 Hz: the honest per-sensor ceiling for an 8+1 (nine sensor) setup
-        // on Android BLE scheduling. Raising to 100 Hz on 9 sensors saturates the radio and
-        // produces high jitter + big gaps (see diagnostics). 50 Hz is plenty for stroke
-        // timing: Nyquist covers rowing harmonics and sub-sample interpolation keeps catch
-        // precision in the 5–10 ms range. Bump to RRATE_100HZ for bench or 1–2 sensor tests.
-        @Volatile var targetRateRegister: Int = RRATE_50HZ
-
         // Debug toggle: when true, the config chain on connect ALSO writes RSW=0x0001 so
         // the sensor emits 0x55 0x50 TIME packets alongside the default 0x55 0x61. Used to
         // measure whether enabling a parallel notification stream halves effective 0x61
         // throughput on a constrained BLE link. Read at config-write time only — toggling
         // mid-connection has no effect; user must reconnect for the change to land.
         @Volatile var enableTimePacket: Boolean = false
-
-        fun expectedHzFor(rrate: Int): Int = when (rrate) {
-            RRATE_10HZ  -> 10
-            RRATE_20HZ  -> 20
-            RRATE_50HZ  -> 50
-            RRATE_100HZ -> 100
-            RRATE_200HZ -> 200
-            else -> 0
-        }
     }
 
     fun hasConnectPermission(): Boolean {
@@ -214,8 +190,7 @@ class BleDeviceClient(private val context: Context) {
             Log.d(
                 tag,
                 "Connect attempt mac=$macLog sdk=${Build.VERSION.SDK_INT} " +
-                    "adapterEnabled=$adapterEnabled connectPerm=${hasConnectPermission()} scanPerm=$scanPermGranted " +
-                    "targetRRATE=0x${"%02X".format(targetRateRegister)}"
+                    "adapterEnabled=$adapterEnabled connectPerm=${hasConnectPermission()} scanPerm=$scanPermGranted"
             )
         }
         onStatus("Connecting to $deviceAddress ...")
@@ -343,9 +318,10 @@ class BleDeviceClient(private val context: Context) {
                     return
                 }
                 if (DEBUG_BLE) Log.d(tag, "CCCD enabled mac=$macLog — queueing config writes")
-                // Notifications are live. Push config: unlock → set ODR → set RSW → save.
+                // Notifications are live. Push config: unlock → set RSW → save. The output
+                // rate is left alone — the sensor streams at whatever rate its flash holds.
                 // Skip (and mark config un-applied) if we don't have the canonical write
-                // characteristic — sensor continues streaming at whatever rate its flash holds.
+                // characteristic.
                 val wc = writeCharacteristic
                 if (wc == null) {
                     markConfigFailed("no canonical write characteristic")
@@ -355,7 +331,7 @@ class BleDeviceClient(private val context: Context) {
                 val rswValue = if (enableTimePacket) RSW_TIME_BIT else RSW_OFF
                 // Always write RSW too: leaves the sensor in a known state regardless of
                 // whatever bitmask happened to be saved in its flash from prior sessions.
-                val frames = listOf(CMD_UNLOCK, cmdSetRate(targetRateRegister), cmdSetRsw(rswValue), CMD_SAVE)
+                val frames = listOf(CMD_UNLOCK, cmdSetRsw(rswValue), CMD_SAVE)
                 beginConfigSequence(frames.size)
                 frames.forEach { pendingWrites.addLast(it) }
                 processNextWrite(gatt)

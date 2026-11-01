@@ -163,8 +163,7 @@ object ApiClient {
             r.sensorId?.let { sb.append(",sensorId=").append(escapeTag(it)) }
             r.seat?.let { sb.append(",seat=").append(escapeTag(it)) }
             sb.append(" received=").append(r.received).append('i')
-                .append(",expected=").append(r.expected).append('i')
-                .append(",dropPct=").append(r.dropPct)
+                .append(",hz=").append(r.hz)
                 .append(",maxGapMs=").append(r.maxGapMs).append('i')
                 .append(",jitterMs=").append(r.jitterMs)
                 .append(",malformed=").append(r.malformed).append('i')

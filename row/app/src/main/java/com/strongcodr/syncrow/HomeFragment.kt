@@ -75,6 +75,12 @@ class HomeFragment : Fragment() {
         }
     }
 
+    private val requestLocationPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+            if (_binding == null) return@registerForActivityResult
+            if (RunPreflight.onLocationPermissionResult(this)) continueStartFlow()
+        }
+
     private val requestNotificationsPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
             if (areNotificationsUsable()) {
@@ -260,11 +266,15 @@ class HomeFragment : Fragment() {
             return
         }
 
-        IntervalRecordingService.start(
-            context = requireContext(),
-            sensors = sensors
-        )
-        findNavController().navigate(R.id.liveRowFragment)
+        // Precise location + GPS on are required; battery optimisation is a warning.
+        RunPreflight.ensureReadyToStart(this, requestLocationPermissions) {
+            if (_binding == null) return@ensureReadyToStart
+            IntervalRecordingService.start(
+                context = requireContext(),
+                sensors = sensors
+            )
+            findNavController().navigate(R.id.liveRowFragment)
+        }
     }
 
     private fun openNotificationSettings() {

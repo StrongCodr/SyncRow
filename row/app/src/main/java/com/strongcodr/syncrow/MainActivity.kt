@@ -1,7 +1,5 @@
 package com.strongcodr.syncrow
 
-import android.Manifest
-import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -12,7 +10,6 @@ import androidx.navigation.ui.AppBarConfiguration
 import androidx.navigation.ui.navigateUp
 import androidx.navigation.ui.setupActionBarWithNavController
 import androidx.navigation.ui.setupWithNavController
-import androidx.core.content.ContextCompat
 import android.content.Intent
 import android.net.Uri
 import android.app.usage.UsageStatsManager
@@ -36,7 +33,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var appBarConfiguration: AppBarConfiguration
     private val requestLocationPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
             if (!hasLocationPermission()) {
                 showLocationSettingsPrompt()
             }
@@ -140,22 +137,17 @@ class MainActivity : AppCompatActivity() {
         showLocationPrompt()
     }
 
-    private fun hasLocationPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-    }
+    private fun hasLocationPermission(): Boolean = RunPreflight.hasPreciseLocation(this)
 
     private fun showLocationPrompt() {
         AlertDialog.Builder(this)
             .setTitle("Allow location")
             .setMessage(
-                "SyncRow records phone location during intervals so your data includes GPS coordinates.\n\n" +
-                    "Please allow location access to enable this."
+                "SyncRow records phone GPS during intervals so your data includes coordinates.\n\n" +
+                    "Please allow precise location to enable this."
             )
             .setPositiveButton("Allow") { _, _ ->
-                requestLocationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                requestLocationPermission.launch(RunPreflight.LOCATION_PERMISSIONS)
             }
             .setNeutralButton("Open Settings") { _, _ ->
                 openAppSettings()
@@ -167,7 +159,7 @@ class MainActivity : AppCompatActivity() {
     private fun showLocationSettingsPrompt() {
         AlertDialog.Builder(this)
             .setTitle("Enable location")
-            .setMessage("Location permission is off. You can enable it in Settings.")
+            .setMessage("Precise location is off. You can enable it in Settings.")
             .setPositiveButton("Open Settings") { _, _ ->
                 openAppSettings()
             }

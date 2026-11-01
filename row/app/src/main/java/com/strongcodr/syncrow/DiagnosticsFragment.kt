@@ -177,11 +177,9 @@ class DiagnosticsFragment : Fragment(R.layout.fragment_diagnostics) {
         }
         holder.title.text = "$name  •  $state"
 
-        // Use signed drop % — negative = surplus (sensor faster than target). Preserve the
-        // sign so mis-configured rates show up instead of being silently clamped to zero.
+        // Observed rate only — the app sets no expectation on the unit's rate (1–200 Hz).
         holder.line1.text = buildString {
-            append("rx ").append(row.received).append(" / ").append(row.expected).append(" Hz")
-            append("  •  drop ").append("%+.1f".format(row.dropPct)).append('%')
+            append("rx ").append(row.received).append("  •  ").append("%.1f".format(row.hz)).append(" Hz")
             append("  •  max gap ").append(row.maxGapMs).append("ms")
             append("  •  jitter ").append("%.1f".format(row.jitterMs)).append("ms")
         }
@@ -206,11 +204,15 @@ class DiagnosticsFragment : Fragment(R.layout.fragment_diagnostics) {
         if (!row.connected) return Color.parseColor("#EEEEEE")      // lighter grey — link down
         if (row.configFailed) return Color.parseColor("#FFCDD2")    // red-ish — real failure
         if (!row.configApplied) return Color.parseColor("#FFF8E1")  // soft yellow — pending, healthy
-        // Absolute drop — surplus (negative) is fine, not a failure.
-        val absDrop = kotlin.math.abs(row.dropPct)
+        // Rate-agnostic health: the largest gap in the window relative to the mean frame
+        // period. Steady streaming at any rate is green; a gap of several periods is a
+        // warning; no frames at all, a reconnect, or a gap of 10+ periods is red.
+        if (row.received <= 0 || row.reconnectsThisWindow > 0) return Color.parseColor("#FFEBEE")
+        val meanPeriodMs = row.windowDurationMs.toDouble() / row.received
+        val gapRatio = if (meanPeriodMs > 0) row.maxGapMs / meanPeriodMs else 0.0
         return when {
-            absDrop < 2.0 -> Color.parseColor("#E8F5E9")
-            absDrop < 10.0 -> Color.parseColor("#FFF8E1")
+            gapRatio < 3.0 -> Color.parseColor("#E8F5E9")
+            gapRatio < 10.0 -> Color.parseColor("#FFF8E1")
             else -> Color.parseColor("#FFEBEE")
         }
     }

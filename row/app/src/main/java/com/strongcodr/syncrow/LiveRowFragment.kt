@@ -97,6 +97,12 @@ class LiveRowFragment : Fragment() {
         }
     }
 
+    private val requestLocationPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+            if (_binding == null) return@registerForActivityResult
+            if (RunPreflight.onLocationPermissionResult(this)) continueStartFlow()
+        }
+
     private val requestNotificationsPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
             if (areNotificationsUsable()) {
@@ -293,7 +299,11 @@ class LiveRowFragment : Fragment() {
             return
         }
 
-        IntervalRecordingService.start(requireContext(), sensors)
+        // Precise location + GPS on are required; battery optimisation is a warning.
+        RunPreflight.ensureReadyToStart(this, requestLocationPermissions) {
+            if (_binding == null) return@ensureReadyToStart
+            IntervalRecordingService.start(requireContext(), sensors)
+        }
     }
 
     private fun openNotificationSettings() {

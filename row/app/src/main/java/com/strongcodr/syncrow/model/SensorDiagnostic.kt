@@ -10,9 +10,12 @@ data class SensorDiagnostic(
     val sensorId: String?,
     val seat: String?,
     val intervalId: Long,
-    val expected: Int,
+    /** Frames that actually arrived in this window. */
     val received: Int,
-    val dropPct: Double,
+    /** Observed rate: received frames per second over the window. There is no expected
+     *  rate — the unit sends at whatever it is set to (1–200 Hz). Defaulted so older
+     *  stored diagnostics (which carried expected/dropPct instead) still load. */
+    val hz: Double = 0.0,
     val maxGapMs: Long,
     val jitterMs: Double,
     val malformed: Int,

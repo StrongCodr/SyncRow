@@ -27,8 +27,11 @@
         tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- Location (required for phone GPS samples) -->
+    <!-- Location (required for phone GPS samples). Precise (fine) is what the app needs;
+         coarse must be declared and requested alongside it on Android 12+, otherwise the
+         system ignores the fine-location request. Only GPS-provider fixes are recorded. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <!-- Backwards compatibility for <=30 -->
     <uses-permission

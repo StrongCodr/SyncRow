@@ -283,7 +283,10 @@ class IntervalRecordingService : Service() {
     private var intervalStartWallMs: Long = 0L
     private var intervalStartElapsedMs: Long = 0L
 
-    private val targetSamplePeriodMs = 10L // ~100 Hz
+    // Tick of the live loop that feeds the stroke analyzer and the UI. IMU frames are NOT
+    // recorded on this tick: each frame is stored when it arrives from the sensor, at
+    // whatever rate the unit sends (1–200 Hz), with its arrival time.
+    private val targetSamplePeriodMs = 10L
 
     private var appIsForeground = true
     private var backgroundSinceMs: Long = 0L
@@ -293,21 +296,10 @@ class IntervalRecordingService : Service() {
     private var pendingResumeSoftResetReason: String? = null
 
     private var lastNotifStatus = "IDLE"
+    // One entry per GPS fix the phone delivers during the run, stamped with the fix's own
+    // time. Only touched on the main thread (location callbacks, start/stop of a run).
     private val locationSamples: MutableList<LocationSample> = mutableListOf()
-    private var latestLocation: LocationSample? = null
-    private val locationDedupeWindowMs = 1000L
-
-    private fun addLocationSampleDeduped(sample: LocationSample) {
-        val last = locationSamples.lastOrNull()
-        if (last != null &&
-            last.latitude == sample.latitude &&
-            last.longitude == sample.longitude &&
-            sample.timestampMs - last.timestampMs < locationDedupeWindowMs
-        ) {
-            return
-        }
-        locationSamples.add(sample)
-    }
+    private var lastLocationFixTimeMs: Long = 0L
     private var locationListener: LocationListener? = null
     private var locationManager: LocationManager? = null
     private val connectAttemptMutex = Mutex()
@@ -503,16 +495,18 @@ class IntervalRecordingService : Service() {
             return
         }
 
-        intervalRunning = true
         sessionIntervalId = nextIntervalId.incrementAndGet()
         intervalStartWallMs = System.currentTimeMillis()
         intervalStartElapsedMs = SystemClock.elapsedRealtime()
+        // Set last (volatile): the BLE sample callback records frames only while this is
+        // true, and reads the start time above — publish it before opening the gate.
+        intervalRunning = true
         // The boat class is fixed to the run at start; it goes to the cloud with the interval
         // (interval_meta point) and stays pending until that upload succeeds.
         IntervalNamesStore.setBoat(this, sessionIntervalId, BoatClassStore.getLast(this))
         IntervalNamesStore.markPending(this, sessionIntervalId)
         locationSamples.clear()
-        latestLocation = null
+        lastLocationFixTimeMs = 0L
         strokeAnalyzer.reset()
 
         prefs.edit()
@@ -553,7 +547,7 @@ class IntervalRecordingService : Service() {
                 existing.displayName = s.displayName
                 existing.role = s.role
                 existing.intervalId = sessionIntervalId
-                existing.samples.clear()
+                synchronized(existing.samples) { existing.samples.clear() }
                 existing.strokeCount = 0
                 existing.currentSpm = 0
                 existing.maxSpm = 0
@@ -761,7 +755,7 @@ class IntervalRecordingService : Service() {
                     interval_id = sessionId,
                     sensor_id = sensor.id, // "Seat N"
                     seat = sensor.seat,
-                    samples = sensor.samples.toList()
+                    samples = synchronized(sensor.samples) { sensor.samples.toList() }
                 )
 
                 saveIntervalLocally(payload, sensor.id)
@@ -1038,6 +1032,18 @@ class IntervalRecordingService : Service() {
                         sensor.lastSeenSampleMs = now
                         sensor.latestSampleMs = now
                         sensor.latestSample = Normalized(nAx, nAy, nAz, nWx, nWy, nWz, nRoll, nPitch, nYaw)
+                        // Record the frame as it comes, stamped with its arrival time. No
+                        // resampling and no assumed rate: the unit may send 1–200 Hz.
+                        if (intervalRunning && now >= intervalStartWallMs) {
+                            val frame = SensorSample(
+                                timestampMs = now,
+                                ax = nAx, ay = nAy, az = nAz,
+                                wx = nWx, wy = nWy, wz = nWz,
+                                roll = nRoll, pitch = nPitch, yaw = nYaw
+                            )
+                            synchronized(sensor.samples) { sensor.samples.add(frame) }
+                            sensor.lastStoredSampleMs = now
+                        }
                         sensor.connected = true
                         sensor.connectInFlight = false
                         sensor.timeout147Count = 0
@@ -1134,30 +1140,13 @@ class IntervalRecordingService : Service() {
                 }
 
                 val nowWall = System.currentTimeMillis()
-                val locationSnapshot = latestLocation
-                if (locationSnapshot != null) {
-                    addLocationSampleDeduped(locationSnapshot.copy(timestampMs = nowWall))
-                }
                 activeSensors.values.toList().forEach { sensor ->
                     val latest = sensor.latestSample ?: return@forEach
                     if (!sensor.connected) return@forEach
                     if (sensor.latestSampleMs < intervalStartWallMs) return@forEach
 
-                    sensor.samples.add(
-                        SensorSample(
-                            timestampMs = nowWall,
-                            ax = latest.ax,
-                            ay = latest.ay,
-                            az = latest.az,
-                            wx = latest.wx,
-                            wy = latest.wy,
-                            wz = latest.wz,
-                            roll = latest.roll,
-                            pitch = latest.pitch,
-                            yaw = latest.yaw
-                        )
-                    )
-                    sensor.lastStoredSampleMs = nowWall
+                    // Recording happens in the BLE sample callback (one row per frame, at
+                    // arrival time). This tick only drives the analyzer and the live UI.
 
                     // Fresh iff a new BLE sample arrived since we last fed this sensor.
                     // If not, latestSample is a zero-order-hold repeat — the analyzer
@@ -1270,7 +1259,7 @@ class IntervalRecordingService : Service() {
 
         // Actual window length since the previous tick. If the coroutine was paused
         // (Doze, long GC, etc.) for longer than maxCleanWindowMs, emitting a row would
-        // produce a wildly inaccurate drop% — reset the baseline and skip this tick.
+        // produce a meaningless observed rate — reset the baseline and skip this tick.
         val rawDeltaMs = if (prevTickElapsedMs == 0L) 1000L else tickElapsedMs - prevTickElapsedMs
         if (rawDeltaMs > maxCleanWindowMs) {
             Log.w("SYNCROW", "Diagnostics tick gap ${rawDeltaMs}ms — dropping row, resetting baseline")
@@ -1280,10 +1269,6 @@ class IntervalRecordingService : Service() {
             )
         }
         val windowDurationMs = rawDeltaMs
-
-        val expectedHzWhole = BleDeviceClient.expectedHzFor(BleDeviceClient.targetRateRegister)
-        // Round instead of truncate: 100 Hz × 999 ms = 99.9 should report expected=100, not 99.
-        val expectedThisWindow = Math.round(expectedHzWhole * windowDurationMs / 1000.0).toInt()
 
         val captureIntervalRunning = intervalRunning
         val captureSessionId = if (captureIntervalRunning) sessionIntervalId else -1L
@@ -1301,22 +1286,22 @@ class IntervalRecordingService : Service() {
         val rows = sensors.mapNotNull { s ->
             try {
                 buildDiagnosticRow(s, tickWallMs, tickElapsedMs, windowDurationMs,
-                    expectedThisWindow, captureIntervalRunning, captureSessionId)
+                    captureIntervalRunning, captureSessionId)
             } catch (e: Throwable) {
                 Log.e("SYNCROW", "Diagnostic row build failed mac=${bleMacForLog(s.mac)}: ${e.message}", e)
                 null
             }
         }
 
-        // Update the existing hzKey prefs so LiveRow/ManageSensors status still works.
-        // Skip disconnected sensors — writing 0 Hz every second is noise, and the disconnect
-        // paths already zero hzKey via the health monitor.
+        // Update the existing hzKey prefs (observed rate) so LiveRow/ManageSensors status
+        // still works. Skip disconnected sensors — writing 0 Hz every second is noise, and
+        // the disconnect paths already zero hzKey via the health monitor.
         if (rows.isNotEmpty()) {
             val editor = prefs.edit()
             var dirty = false
             rows.forEach { r ->
                 if (r.connected) {
-                    editor.putFloat(hzKey(r.sensorMac), r.received.toFloat())
+                    editor.putFloat(hzKey(r.sensorMac), r.hz.toFloat())
                     dirty = true
                 }
             }
@@ -1354,17 +1339,14 @@ class IntervalRecordingService : Service() {
         tickWallMs: Long,
         tickElapsedMs: Long,
         windowDurationMs: Long,
-        expectedThisWindow: Int,
         captureIntervalRunning: Boolean,
         captureSessionId: Long
     ): SensorDiagnostic {
         val snap = s.client.snapshotAndReset()
         val received = snap.received
-        // Signed drop %: negative means surplus. Preserve the sign so misconfigured rates
-        // surface instead of being silently clamped to zero.
-        val dropPct = if (expectedThisWindow > 0) {
-            (expectedThisWindow - received) * 100.0 / expectedThisWindow
-        } else 0.0
+        // Observed rate only: frames that actually arrived over the window. There is no
+        // expected rate — the unit sends whatever it is set to (1–200 Hz).
+        val hz = if (windowDurationMs > 0) received * 1000.0 / windowDurationMs else 0.0
         val reconnects = s.reconnectsThisWindow.getAndSet(0)
 
         return SensorDiagnostic(
@@ -1375,9 +1357,8 @@ class IntervalRecordingService : Service() {
             sensorId = if (captureIntervalRunning) s.id else null,
             seat = s.seat,
             intervalId = captureSessionId,
-            expected = expectedThisWindow,
             received = received,
-            dropPct = dropPct,
+            hz = hz,
             maxGapMs = snap.maxGapMs,
             jitterMs = snap.jitterMs,
             malformed = snap.malformed,
@@ -1402,33 +1383,21 @@ class IntervalRecordingService : Service() {
 
         val mgr = getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
         locationManager = mgr
-        val lastKnown = pickBestLastKnownLocation(mgr)
-        latestLocation = lastKnown?.toSample()
-        if (lastKnown != null && intervalRunning) {
-            addLocationSampleDeduped(latestLocation!!)
-        }
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
-                val sample = location.toSample()
-                latestLocation = sample
-                if (intervalRunning) {
-                    addLocationSampleDeduped(sample)
-                }
+                recordGpsFix(location)
             }
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {}
         }
         locationListener = listener
 
         try {
-            Log.e("SYNCROW", "Location updates: gps=${mgr.isProviderEnabled(LocationManager.GPS_PROVIDER)} network=${mgr.isProviderEnabled(LocationManager.NETWORK_PROVIDER)}")
+            Log.e("SYNCROW", "Location updates: gps=${mgr.isProviderEnabled(LocationManager.GPS_PROVIDER)}")
+            // Satellite fixes only. The network (cell/wifi) provider is never requested, and
+            // no last-known location is seeded: a point is written only for a real new fix.
             mgr.requestLocationUpdates(
                 LocationManager.GPS_PROVIDER,
-                0L,
-                0f,
-                listener,
-                Looper.getMainLooper()
-            )
-            mgr.requestLocationUpdates(
-                LocationManager.NETWORK_PROVIDER,
                 0L,
                 0f,
                 listener,
@@ -1439,24 +1408,28 @@ class IntervalRecordingService : Service() {
         }
     }
 
-    private fun pickBestLastKnownLocation(mgr: LocationManager): Location? {
-        val providers = listOf(
-            LocationManager.GPS_PROVIDER,
-            LocationManager.NETWORK_PROVIDER,
-            LocationManager.PASSIVE_PROVIDER
-        )
-        var best: Location? = null
-        providers.forEach { provider ->
-            try {
-                val loc = mgr.getLastKnownLocation(provider) ?: return@forEach
-                if (best == null || loc.time > best!!.time) {
-                    best = loc
-                }
-            } catch (_: Exception) {
-            }
-        }
-        return best
+    /**
+     * Store one phone_location row per real GPS fix, stamped with the time of the fix
+     * (Location.time), not the time we happened to look. Anything that is not a fresh
+     * satellite fix — another provider, a mock, a re-delivered or older fix — is dropped.
+     */
+    private fun recordGpsFix(location: Location) {
+        if (!intervalRunning) return
+        if (location.provider != LocationManager.GPS_PROVIDER) return
+        if (isMockFix(location)) return
+        val fixTimeMs = location.time
+        if (fixTimeMs <= 0L || fixTimeMs <= lastLocationFixTimeMs) return
+        lastLocationFixTimeMs = fixTimeMs
+        locationSamples.add(location.toSample())
     }
+
+    private fun isMockFix(location: Location): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            location.isMock
+        } else {
+            @Suppress("DEPRECATION")
+            location.isFromMockProvider
+        }
 
     private fun stopLocationUpdates() {
         val mgr = locationManager ?: return
@@ -1472,7 +1445,7 @@ class IntervalRecordingService : Service() {
 
     private fun Location.toSample(): LocationSample {
         return LocationSample(
-            timestampMs = System.currentTimeMillis(),
+            timestampMs = time,
             latitude = latitude,
             longitude = longitude,
             altitude = if (hasAltitude()) altitude else null,
