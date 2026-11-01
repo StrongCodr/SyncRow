@@ -86,9 +86,22 @@ class BleDeviceClient(private val context: Context) {
         // WIT protocol config frames: 5-byte [FF AA <reg> <lo> <hi>]
         private val CMD_UNLOCK = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x69.toByte(), 0x88.toByte(), 0xB5.toByte())
         private val CMD_SAVE   = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())
-        // The output rate (RRATE register 0x03) is deliberately NOT written: the app sets no
-        // expectation on the unit's rate. Whatever the unit is configured to send (1–200 Hz)
-        // is recorded as it arrives; the diagnostics report the observed rate.
+        private fun cmdSetRate(rrate: Int) = byteArrayOf(
+            0xFF.toByte(), 0xAA.toByte(), 0x03.toByte(), rrate.toByte(), 0x00.toByte()
+        )
+
+        // RRATE register values (0x03). See wit_sensor_protocol memory.
+        const val RRATE_10HZ  = 0x06
+        const val RRATE_20HZ  = 0x07
+        const val RRATE_50HZ  = 0x08
+        const val RRATE_100HZ = 0x09
+        const val RRATE_200HZ = 0x0B
+
+        // The rate asked of the units on connect. It is a request, not an expectation: over BLE
+        // with several units the phone cannot keep up and the delivered rate is whatever it is
+        // (about 25 Hz on a Samsung with three units). The app records frames as they arrive
+        // and the diagnostics report the observed rate; nothing assumes this value is met.
+        @Volatile var targetRateRegister: Int = RRATE_50HZ
 
         // RSW (Output Selection) register bitmask. On the BLE 5.0 firmware family, the
         // 0x61 combined packet streams automatically regardless of RSW. Bit 0 controls the
@@ -190,7 +203,8 @@ class BleDeviceClient(private val context: Context) {
             Log.d(
                 tag,
                 "Connect attempt mac=$macLog sdk=${Build.VERSION.SDK_INT} " +
-                    "adapterEnabled=$adapterEnabled connectPerm=${hasConnectPermission()} scanPerm=$scanPermGranted"
+                    "adapterEnabled=$adapterEnabled connectPerm=${hasConnectPermission()} scanPerm=$scanPermGranted " +
+                    "targetRRATE=0x${"%02X".format(targetRateRegister)}"
             )
         }
         onStatus("Connecting to $deviceAddress ...")
@@ -318,8 +332,9 @@ class BleDeviceClient(private val context: Context) {
                     return
                 }
                 if (DEBUG_BLE) Log.d(tag, "CCCD enabled mac=$macLog — queueing config writes")
-                // Notifications are live. Push config: unlock → set RSW → save. The output
-                // rate is left alone — the sensor streams at whatever rate its flash holds.
+                // Notifications are live. Push config: unlock → set ODR → set RSW → save. The
+                // rate is a request the unit may not meet over BLE; frames are recorded as they
+                // arrive whatever the delivered rate.
                 // Skip (and mark config un-applied) if we don't have the canonical write
                 // characteristic.
                 val wc = writeCharacteristic
@@ -331,7 +346,7 @@ class BleDeviceClient(private val context: Context) {
                 val rswValue = if (enableTimePacket) RSW_TIME_BIT else RSW_OFF
                 // Always write RSW too: leaves the sensor in a known state regardless of
                 // whatever bitmask happened to be saved in its flash from prior sessions.
-                val frames = listOf(CMD_UNLOCK, cmdSetRsw(rswValue), CMD_SAVE)
+                val frames = listOf(CMD_UNLOCK, cmdSetRate(targetRateRegister), cmdSetRsw(rswValue), CMD_SAVE)
                 beginConfigSequence(frames.size)
                 frames.forEach { pendingWrites.addLast(it) }
                 processNextWrite(gatt)
