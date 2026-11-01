@@ -38,6 +38,29 @@ object ApiClient {
             .replace(",", "\\,")
             .replace("=", "\\=")
 
+    private fun escapeStringField(value: String): String =
+        value.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    /** The id tag every measurement of an interval carries. The user's name never goes here. */
+    fun intervalLabel(intervalId: Long): String = "Interval_$intervalId"
+
+    /**
+     * Record the user's name for an interval as one `interval_meta` point tagged with the interval id.
+     * The portal reads the latest point per interval and shows the name beside the date; it writes the
+     * same measurement when a name is set there. An empty name clears it.
+     */
+    fun uploadIntervalName(intervalId: Long, name: String): Pair<Boolean, Int> {
+        val line = "interval_meta,intervalId=${escapeTag(intervalLabel(intervalId))} " +
+            "name=\"${escapeStringField(name.trim())}\" ${System.currentTimeMillis()}"
+        val body = line.toRequestBody("text/plain; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("$INFLUX_BASE_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=ms")
+            .addHeader("Authorization", "Token $INFLUX_TOKEN")
+            .post(body)
+            .build()
+        client.newCall(request).execute().use { resp -> return Pair(resp.isSuccessful, resp.code) }
+    }
+
     // InfluxDB write batch size, applied uniformly to IMU samples, location samples,
     // and diagnostic rows. Chosen to stay well under InfluxDB Cloud's line-protocol
     // payload limit while keeping connection count low.

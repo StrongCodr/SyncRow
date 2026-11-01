@@ -14,6 +14,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import com.strongcodr.syncrow.model.IntervalMeta
+import com.strongcodr.syncrow.network.ApiClient
 import com.strongcodr.syncrow.model.SessionSummary
 import com.strongcodr.syncrow.model.SyncStatus
 import com.strongcodr.syncrow.storage.IntervalIndexStore
@@ -233,8 +234,17 @@ class IntervalsFragment : Fragment() {
             .setPositiveButton("Save") { _, _ ->
                 val name = input.text.toString().trim()
                 if (name.isNotEmpty()) {
-                    IntervalNamesStore.set(requireContext(), meta.id, name)
+                    val ctx = requireContext().applicationContext
+                    IntervalNamesStore.set(ctx, meta.id, name)
+                    IntervalNamesStore.markPending(ctx, meta.id)
                     intervalsViewModel.refresh(requireContext())
+                    // Already in the cloud: push the name now; otherwise it goes with the upload.
+                    if (meta.syncStatus == SyncStatus.SYNCED) {
+                        Thread {
+                            val ok = try { ApiClient.uploadIntervalName(meta.id, name).first } catch (_: Exception) { false }
+                            if (ok) IntervalNamesStore.clearPending(ctx, meta.id)
+                        }.start()
+                    }
                 }
             }
             .setNegativeButton("Cancel", null)

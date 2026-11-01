@@ -17,6 +17,28 @@ object IntervalNamesStore {
     private fun file(context: Context): File =
         File(dir(context), "names.json")
 
+    private fun pendingFile(context: Context): File =
+        File(dir(context), "names_pending.json")
+
+    /** Ids whose name has not reached the cloud yet (set on rename, cleared after a successful upload). */
+    fun pending(context: Context): MutableSet<Long> {
+        val f = pendingFile(context)
+        if (!f.exists()) return mutableSetOf()
+        return try {
+            f.readText().split(",").filter { it.isNotBlank() }.map { it.trim().toLong() }.toMutableSet()
+        } catch (_: Exception) {
+            mutableSetOf()
+        }
+    }
+
+    fun markPending(context: Context, id: Long) {
+        val p = pending(context); p.add(id); pendingFile(context).writeText(p.joinToString(","))
+    }
+
+    fun clearPending(context: Context, id: Long) {
+        val p = pending(context); p.remove(id); pendingFile(context).writeText(p.joinToString(","))
+    }
+
     fun load(context: Context): MutableMap<Long, String> {
         val f = file(context)
         if (!f.exists()) return mutableMapOf()
@@ -50,6 +72,7 @@ object IntervalNamesStore {
         val map = load(context)
         map.remove(id)
         save(context, map)
+        clearPending(context, id)
     }
 
     private fun save(context: Context, map: Map<Long, String>) {

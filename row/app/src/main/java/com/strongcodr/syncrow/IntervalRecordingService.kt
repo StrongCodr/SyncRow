@@ -730,6 +730,7 @@ class IntervalRecordingService : Service() {
                     }
                 )
                 if (!failed && !retryableAny) {
+                    scope.launch { uploadIntervalNameIfAny(sessionId) }
                     postEventNotification(
                         "Data synced",
                         "Session synced. Open Previous Intervals for the recap."
@@ -780,8 +781,7 @@ class IntervalRecordingService : Service() {
                     setOngoingNotification("SYNCING")
 
                     val (success, code) = try {
-                        val intervalLabel = IntervalNamesStore.get(this@IntervalRecordingService, sessionId)
-                            ?: "Interval_${sessionId}"
+                        val intervalLabel = ApiClient.intervalLabel(sessionId)
                         ApiClient.uploadInterval(payload, intervalLabel)
                     } catch (e: Exception) {
                         Log.e("SYNCROW", "Upload threw exception: ${e.javaClass.simpleName}: ${e.message}", e)
@@ -833,8 +833,7 @@ class IntervalRecordingService : Service() {
                 }
 
                 val (success, code) = try {
-                    val intervalLabel = IntervalNamesStore.get(this@IntervalRecordingService, sessionId)
-                        ?: "Interval_${sessionId}"
+                    val intervalLabel = ApiClient.intervalLabel(sessionId)
                     ApiClient.uploadLocation(locationPayload, intervalLabel)
                 } catch (e: Exception) {
                     Log.e("SYNCROW", "Location upload threw exception: ${e.javaClass.simpleName}: ${e.message}", e)
@@ -900,8 +899,7 @@ class IntervalRecordingService : Service() {
                     return@launch
                 }
 
-                val intervalLabel = IntervalNamesStore.get(this@IntervalRecordingService, sessionId)
-                    ?: "Interval_${sessionId}"
+                val intervalLabel = ApiClient.intervalLabel(sessionId)
 
                 val (success, code) = try {
                     ApiClient.uploadDiagnostics(rows, intervalLabel)
@@ -1945,11 +1943,30 @@ class IntervalRecordingService : Service() {
         }
     }
 
+    /** Send the user's name for an interval (if any) as an interval_meta point; keeps it pending on failure. */
+    private fun uploadIntervalNameIfAny(intervalId: Long) {
+        val name = IntervalNamesStore.get(this, intervalId) ?: return
+        val (ok, code) = try {
+            ApiClient.uploadIntervalName(intervalId, name)
+        } catch (e: Exception) {
+            Log.e("SYNCROW", "Name upload threw: ${e.javaClass.simpleName}: ${e.message}", e)
+            Pair(false, -1)
+        }
+        if (ok) IntervalNamesStore.clearPending(this, intervalId)
+        else { IntervalNamesStore.markPending(this, intervalId); Log.w("SYNCROW", "Name upload failed for intervalId=$intervalId code=$code") }
+    }
+
+    /** Names changed after their interval was synced wait here until there is a network. */
+    private fun uploadPendingNames() {
+        IntervalNamesStore.pending(this).forEach { id -> uploadIntervalNameIfAny(id) }
+    }
+
     private fun uploadPendingIntervalsIfNeeded() {
         if (!pendingUploadActive.compareAndSet(false, true)) return
         scope.launch {
             try {
                 if (!hasInternetNow()) return@launch
+                uploadPendingNames()
 
                 val pending = IntervalIndexStore.load(this@IntervalRecordingService)
                     .filter { it.syncStatus == SyncStatus.SYNCING || it.syncStatus == SyncStatus.PENDING }
@@ -1962,8 +1979,7 @@ class IntervalRecordingService : Service() {
 
                     var anyFailed = false
                     var anyRetryable = false
-                    val intervalLabel = IntervalNamesStore.get(this@IntervalRecordingService, meta.id)
-                        ?: "Interval_${meta.id}"
+                    val intervalLabel = ApiClient.intervalLabel(meta.id)
 
                     payloads.forEach { payload ->
                         val (success, code) = try {
@@ -2069,6 +2085,7 @@ class IntervalRecordingService : Service() {
                     }
 
                     if (!anyFailed && !anyRetryable) {
+                        uploadIntervalNameIfAny(meta.id)
                         IntervalIndexStore.updateStatus(
                             this@IntervalRecordingService,
                             meta.id,
