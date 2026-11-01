@@ -21,6 +21,8 @@ import androidx.fragment.app.activityViewModels
 import androidx.navigation.fragment.findNavController
 import com.strongcodr.syncrow.databinding.FragmentLiveRowBinding
 import com.google.android.material.card.MaterialCardView
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.TextView
 import android.widget.LinearLayout
 import android.widget.Toast
@@ -46,6 +48,7 @@ class LiveRowFragment : Fragment() {
             val sensors = sensorsViewModel.sensors.value.orEmpty()
             val running = prefs.getBoolean(KEY_INTERVAL_RUNNING, false)
             binding.buttonInterval.text = if (running) "Stop Interval" else "Start Interval"
+            binding.spinnerBoatClass.isEnabled = !running
 
             var spmSum = 0
             var spmCount = 0
@@ -138,10 +141,12 @@ class LiveRowFragment : Fragment() {
         }
 
         binding.buttonInterval.setOnClickListener { onStartStopPressed() }
+        setupBoatClassPicker()
     }
 
     override fun onStart() {
         super.onStart()
+        syncBoatClassPicker()
         ensureConnectedIfNeeded()
         ensureInitialStatus()
         handler.post(pollRunnable)
@@ -154,6 +159,33 @@ class LiveRowFragment : Fragment() {
     override fun onStop() {
         super.onStop()
         handler.removeCallbacks(pollRunnable)
+    }
+
+
+    /** Boat class picker beside the Start button: shows the last choice, remembers a new one. */
+    private fun setupBoatClassPicker() {
+        val spinner = binding.spinnerBoatClass
+        spinner.adapter = ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            BoatClassStore.CLASSES
+        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        syncBoatClassPicker()
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                BoatClassStore.setLast(requireContext(), BoatClassStore.CLASSES[position])
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+    }
+
+    /** Re-read the stored choice (another screen may have changed it). */
+    private fun syncBoatClassPicker() {
+        val index = BoatClassStore.CLASSES.indexOf(BoatClassStore.getLast(requireContext()))
+        if (index >= 0 && binding.spinnerBoatClass.selectedItemPosition != index) {
+            binding.spinnerBoatClass.setSelection(index, false)
+        }
     }
 
     private fun onStartStopPressed() {

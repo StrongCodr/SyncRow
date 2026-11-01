@@ -45,13 +45,19 @@ object ApiClient {
     fun intervalLabel(intervalId: Long): String = "Interval_$intervalId"
 
     /**
-     * Record the user's name for an interval as one `interval_meta` point tagged with the interval id.
-     * The portal reads the latest point per interval and shows the name beside the date; it writes the
-     * same measurement when a name is set there. An empty name clears it.
+     * Record the user's metadata for an interval as one `interval_meta` point tagged with the interval id:
+     * the name (`name` field) and the boat class (`boat` field, e.g. "2x"), whichever are set. The portal
+     * reads the latest point per interval and shows them beside the date; it writes the same measurement
+     * when a name is set there. An empty name clears it. With neither field there is nothing to write.
      */
-    fun uploadIntervalName(intervalId: Long, name: String): Pair<Boolean, Int> {
+    fun uploadIntervalMeta(intervalId: Long, name: String?, boat: String?): Pair<Boolean, Int> {
+        val fields = listOfNotNull(
+            name?.let { "name=\"${escapeStringField(it.trim())}\"" },
+            boat?.let { "boat=\"${escapeStringField(it)}\"" }
+        )
+        if (fields.isEmpty()) return Pair(true, 204)
         val line = "interval_meta,intervalId=${escapeTag(intervalLabel(intervalId))} " +
-            "name=\"${escapeStringField(name.trim())}\" ${System.currentTimeMillis()}"
+            "${fields.joinToString(",")} ${System.currentTimeMillis()}"
         val body = line.toRequestBody("text/plain; charset=utf-8".toMediaType())
         val request = Request.Builder()
             .url("$INFLUX_BASE_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=ms")

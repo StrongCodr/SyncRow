@@ -165,10 +165,11 @@ class IntervalsFragment : Fragment() {
         }
 
         val duration = formatDuration(meta.endTimeMillis - meta.startTimeMillis)
+        val boat = IntervalNamesStore.getBoat(requireContext(), meta.id)
         // Collapse to a single "All synced" line when all present statuses agree, to keep
         // the subtitle from growing to 4 concatenated clauses on narrow phones. Fall back
         // to per-channel breakdown when any diverge.
-        val subtitleText = buildSyncSubtitle(duration, meta)
+        val subtitleText = buildSyncSubtitle(duration, meta).let { if (boat != null) "$boat • $it" else it }
 
         val subtitle = TextView(requireContext()).apply {
             text = subtitleText
@@ -241,7 +242,8 @@ class IntervalsFragment : Fragment() {
                     // Already in the cloud: push the name now; otherwise it goes with the upload.
                     if (meta.syncStatus == SyncStatus.SYNCED) {
                         Thread {
-                            val ok = try { ApiClient.uploadIntervalName(meta.id, name).first } catch (_: Exception) { false }
+                            val boat = IntervalNamesStore.getBoat(ctx, meta.id)
+                            val ok = try { ApiClient.uploadIntervalMeta(meta.id, name, boat).first } catch (_: Exception) { false }
                             if (ok) IntervalNamesStore.clearPending(ctx, meta.id)
                         }.start()
                     }
@@ -259,7 +261,7 @@ class IntervalsFragment : Fragment() {
                 // ✅ THIS was the missing piece: remove from index
                 IntervalIndexStore.delete(requireContext(), meta.id)
 
-                // remove rename if any
+                // remove rename and boat class if any
                 IntervalNamesStore.delete(requireContext(), meta.id)
 
                 // delete stored interval payload files + summary
@@ -276,7 +278,7 @@ class IntervalsFragment : Fragment() {
             .setTitle("Delete all intervals?")
             .setMessage("This will delete all intervals from History and remove their saved data on this phone.")
             .setPositiveButton("Delete all") { _, _ ->
-                // delete all payload files + names
+                // delete all payload files + names + boat classes
                 metas.forEach { meta ->
                     deleteIntervalFiles(meta.id)
                     IntervalNamesStore.delete(requireContext(), meta.id)

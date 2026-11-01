@@ -507,6 +507,10 @@ class IntervalRecordingService : Service() {
         sessionIntervalId = nextIntervalId.incrementAndGet()
         intervalStartWallMs = System.currentTimeMillis()
         intervalStartElapsedMs = SystemClock.elapsedRealtime()
+        // The boat class is fixed to the run at start; it goes to the cloud with the interval
+        // (interval_meta point) and stays pending until that upload succeeds.
+        IntervalNamesStore.setBoat(this, sessionIntervalId, BoatClassStore.getLast(this))
+        IntervalNamesStore.markPending(this, sessionIntervalId)
         locationSamples.clear()
         latestLocation = null
         strokeAnalyzer.reset()
@@ -730,7 +734,7 @@ class IntervalRecordingService : Service() {
                     }
                 )
                 if (!failed && !retryableAny) {
-                    scope.launch { uploadIntervalNameIfAny(sessionId) }
+                    scope.launch { uploadIntervalMetaIfAny(sessionId) }
                     postEventNotification(
                         "Data synced",
                         "Session synced. Open Previous Intervals for the recap."
@@ -1943,22 +1947,27 @@ class IntervalRecordingService : Service() {
         }
     }
 
-    /** Send the user's name for an interval (if any) as an interval_meta point; keeps it pending on failure. */
-    private fun uploadIntervalNameIfAny(intervalId: Long) {
-        val name = IntervalNamesStore.get(this, intervalId) ?: return
+    /** Send the user's name and boat class for an interval (if any) as one interval_meta point; keeps it pending on failure. */
+    private fun uploadIntervalMetaIfAny(intervalId: Long) {
+        val name = IntervalNamesStore.get(this, intervalId)
+        val boat = IntervalNamesStore.getBoat(this, intervalId)
+        if (name == null && boat == null) {
+            IntervalNamesStore.clearPending(this, intervalId)
+            return
+        }
         val (ok, code) = try {
-            ApiClient.uploadIntervalName(intervalId, name)
+            ApiClient.uploadIntervalMeta(intervalId, name, boat)
         } catch (e: Exception) {
-            Log.e("SYNCROW", "Name upload threw: ${e.javaClass.simpleName}: ${e.message}", e)
+            Log.e("SYNCROW", "Meta upload threw: ${e.javaClass.simpleName}: ${e.message}", e)
             Pair(false, -1)
         }
         if (ok) IntervalNamesStore.clearPending(this, intervalId)
-        else { IntervalNamesStore.markPending(this, intervalId); Log.w("SYNCROW", "Name upload failed for intervalId=$intervalId code=$code") }
+        else { IntervalNamesStore.markPending(this, intervalId); Log.w("SYNCROW", "Meta upload failed for intervalId=$intervalId code=$code") }
     }
 
-    /** Names changed after their interval was synced wait here until there is a network. */
-    private fun uploadPendingNames() {
-        IntervalNamesStore.pending(this).forEach { id -> uploadIntervalNameIfAny(id) }
+    /** Names and boat classes that have not reached the cloud yet wait here until there is a network. */
+    private fun uploadPendingMeta() {
+        IntervalNamesStore.pending(this).forEach { id -> uploadIntervalMetaIfAny(id) }
     }
 
     private fun uploadPendingIntervalsIfNeeded() {
@@ -1966,7 +1975,7 @@ class IntervalRecordingService : Service() {
         scope.launch {
             try {
                 if (!hasInternetNow()) return@launch
-                uploadPendingNames()
+                uploadPendingMeta()
 
                 val pending = IntervalIndexStore.load(this@IntervalRecordingService)
                     .filter { it.syncStatus == SyncStatus.SYNCING || it.syncStatus == SyncStatus.PENDING }
@@ -2085,7 +2094,7 @@ class IntervalRecordingService : Service() {
                     }
 
                     if (!anyFailed && !anyRetryable) {
-                        uploadIntervalNameIfAny(meta.id)
+                        uploadIntervalMetaIfAny(meta.id)
                         IntervalIndexStore.updateStatus(
                             this@IntervalRecordingService,
                             meta.id,

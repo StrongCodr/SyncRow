@@ -58,4 +58,16 @@
         app:layout_constraintEnd_toEndOf="parent"
         android:layout_marginBottom="24dp" />
 
+    <!-- Boat class for the next run (1x, 2x, 2-, ...); locked while an interval is running -->
+    <Spinner
+        android:id="@+id/spinner_boat_class"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:minWidth="72dp"
+        android:layout_marginEnd="12dp"
+        android:contentDescription="Boat class"
+        app:layout_constraintTop_toTopOf="@id/button_interval"
+        app:layout_constraintBottom_toBottomOf="@id/button_interval"
+        app:layout_constraintEnd_toStartOf="@id/button_interval" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>
